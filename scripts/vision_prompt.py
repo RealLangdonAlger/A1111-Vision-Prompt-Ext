@@ -34,6 +34,29 @@ def load_presets():
 SYSTEM_PROMPT_PRESETS = load_presets()
 
 
+def _write_presets():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    preset_path = os.path.join(base_dir, "..", "presets.json")
+    with open(preset_path, "w", encoding="utf-8") as f:
+        json.dump(SYSTEM_PROMPT_PRESETS, f, indent=2, ensure_ascii=False)
+
+def save_preset(name: str, prompt: str):
+    if not name.strip():
+        raise Exception("[Vision Prompt] Preset name cannot be empty.")
+    SYSTEM_PROMPT_PRESETS[name.strip()] = prompt
+    _write_presets()
+    choices = list(SYSTEM_PROMPT_PRESETS.keys())
+    return gr.update(choices=choices, value=name.strip()), name.strip()
+
+def delete_preset(name: str):
+    if name == "Custom":
+        raise Exception("[Vision Prompt] Cannot delete the Custom preset.")
+    SYSTEM_PROMPT_PRESETS.pop(name, None)
+    _write_presets()
+    choices = list(SYSTEM_PROMPT_PRESETS.keys())
+    return gr.update(choices=choices, value="Custom"), "Custom"
+
+
 def stitch_images_horizontal(images: list, gap: int = 0) -> Image.Image:
     """
     Stitch a list of PIL images side-by-side with an optional gap between them.
@@ -115,25 +138,47 @@ class VisionPromptScript(scripts.Script):
                                 image_inputs.append(img_input)
 
                         # ── Preset / system prompt ─────────────────────────
-                        preset_dropdown = gr.Dropdown(
-                            label="Preset",
-                            choices=list(SYSTEM_PROMPT_PRESETS.keys()),
-                            value="Custom"
-                        )
+                        gr.Markdown("**Preset**")
+                        with gr.Row(equal_height=True):
+                            preset_dropdown = gr.Dropdown(
+                                choices=list(SYSTEM_PROMPT_PRESETS.keys()),
+                                value="Custom",
+                                scale=2,
+                                show_label=False
+                            )
 
-                        def apply_preset(choice):
-                            return SYSTEM_PROMPT_PRESETS.get(choice, "")
+                            preset_name_input = gr.Textbox(
+                                placeholder="Preset name...",
+                                show_label=False,
+                                scale=1,
+                                max_lines=1
+                            )
+
+                            save_btn = gr.Button("💾", scale=0, min_width=40)
+                            delete_btn = gr.Button("🗑️", scale=0, min_width=40)
 
                         system_prompt = gr.Textbox(
                             label="System Prompt",
-                            value="Describe this image in detail for Stable Diffusion prompting.",
-                            height=64
+                            value="Describe this image in detail for Stable Diffusion prompting."
                         )
+
+                        def apply_preset(choice):
+                            return SYSTEM_PROMPT_PRESETS.get(choice, ""), choice
 
                         preset_dropdown.change(
                             fn=apply_preset,
                             inputs=[preset_dropdown],
-                            outputs=[system_prompt]
+                            outputs=[system_prompt, preset_name_input]
+                        )
+                        save_btn.click(
+                            fn=save_preset,
+                            inputs=[preset_name_input, system_prompt],
+                            outputs=[preset_dropdown, preset_name_input]
+                        )
+                        delete_btn.click(
+                            fn=delete_preset,
+                            inputs=[preset_dropdown],
+                            outputs=[preset_dropdown, preset_name_input]
                         )
 
                         weight = gr.Slider(
