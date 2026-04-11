@@ -12,10 +12,13 @@ from modules.processing import StableDiffusionProcessing
 
 import hashlib
 
-VISION_CACHE = {}
+VISION_CACHE = [{} for _ in range(4)]  # one dict per slot, max 5 entries each
 
 # How many image drop zones to show per slot
 IMAGES_PER_SLOT = 4
+
+# Seconds to wait for a vision API response before giving up
+TIMEOUT_SECONDS = 30
 
 def load_presets():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -210,8 +213,10 @@ class VisionPromptScript(scripts.Script):
             hash_input = hash_parts + system_prompt.encode("utf-8") + model_name.encode("utf-8")
             cache_key  = hashlib.sha256(hash_input).hexdigest()
 
-            if cache_key in VISION_CACHE:
-                vision_output = VISION_CACHE[cache_key]
+            slot_cache = VISION_CACHE[slot_idx]
+
+            if cache_key in slot_cache:
+                vision_output = slot_cache[cache_key]
                 print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
             else:
                 print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
@@ -242,13 +247,23 @@ class VisionPromptScript(scripts.Script):
                     headers = {"Content-Type": "application/json"}
                     if api_key and api_key.strip():
                         headers["Authorization"] = f"Bearer {api_key.strip()}"
-                    response = requests.post(api_url, json=payload, headers=headers)
+                    response = requests.post(api_url, json=payload, headers=headers, timeout=TIMEOUT_SECONDS)
                     response.raise_for_status()
                     data = response.json()
                     vision_output = data["choices"][0]["message"]["content"]
-                    VISION_CACHE[cache_key] = vision_output
+
+                    # Evict oldest entry if at capacity
+                    if len(slot_cache) >= 5:
+                        oldest_key = next(iter(slot_cache))
+                        del slot_cache[oldest_key]
+                    slot_cache[cache_key] = vision_output
+                except requests.exceptions.Timeout:
+                    msg = f"[Vision Prompt] Slot {slot_idx+1}: Request timed out after {TIMEOUT_SECONDS}s"
+                    print(msg)
+                    continue
                 except Exception as e:
-                    print(f"[Vision Prompt][Slot {slot_idx+1}] API error: {e}")
+                    msg = f"[Vision Prompt] Slot {slot_idx+1}: API error: {e}"
+                    print(msg)
                     continue
 
             if not vision_output:
