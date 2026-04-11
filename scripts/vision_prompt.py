@@ -88,6 +88,10 @@ def stitch_images_horizontal(images: list, gap: int = 0) -> Image.Image:
 
 class VisionPromptScript(scripts.Script):
 
+    def __init__(self):
+        self.infotext_fields = []
+        self.paste_field_names = []
+
     def title(self):
         return "Vision Prompt Injector"
 
@@ -95,6 +99,23 @@ class VisionPromptScript(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
+        gr.HTML("""
+            <style>
+            .vp-params-box {
+                border: 1px solid var(--block-border-color);
+                border-radius: 8px;
+                padding: 10px;
+                margin-top: 8px;
+                margin-bottom: 4px;
+            }
+            .vp-image-box {
+                border: 1px solid var(--block-border-color);
+                border-radius: 8px;
+                padding: 4px;
+                margin: 0px;
+            }
+            </style>
+            """)
         with gr.Accordion("Vision Prompt", open=False):
             enabled = gr.Checkbox(label="Enable Vision Prompt", value=False)
 
@@ -114,6 +135,39 @@ class VisionPromptScript(scripts.Script):
                 label="Model",
                 value="gpt-4o-mini"
             )
+            
+            with gr.Row(elem_classes="vp-params-box"):
+                temperature = gr.Slider(
+                    label="Temperature",
+                    minimum=0.0,
+                    maximum=2.0,
+                    value=0.7,
+                    step=0.05
+                )
+
+                top_p = gr.Slider(
+                    label="Top-p",
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=1.0,
+                    step=0.05
+                )
+
+                top_k = gr.Slider(
+                    label="Top-k",
+                    minimum=0,
+                    maximum=100,
+                    value=0,
+                    step=1
+                )
+                
+                max_tokens = gr.Slider(
+                    label="Max Tokens",
+                    minimum=16,
+                    maximum=1024,
+                    value=256,
+                    step=16
+                )
 
             tabs_data = []
 
@@ -128,12 +182,13 @@ class VisionPromptScript(scripts.Script):
                         )
 
                         image_inputs = []
-                        with gr.Row():
+                        with gr.Row(elem_classes="vp-image-box"):
                             for j in range(IMAGES_PER_SLOT):
                                 img_input = gr.Image(
                                     type="pil",
                                     label=f"Image {j+1}",
                                     height=192,
+                                    elem_classes="vp-image-box"
                                 )
                                 image_inputs.append(img_input)
 
@@ -193,11 +248,51 @@ class VisionPromptScript(scripts.Script):
                         tabs_data.extend(image_inputs)
                         tabs_data.extend([system_prompt, weight])
 
-        return [enabled, api_url, model_name, api_key] + tabs_data
+        # ── Persistent settings & PNG metadata ────────────────────────────
+        # Stable label strings become keys in PNG infotext.
+        # api_key intentionally excluded — never write secrets to metadata.
+        self.infotext_fields = [
+            (enabled,     "VP Enabled"),
+            (api_url,     "VP API URL"),
+            (model_name,  "VP Model"),
+            (temperature, "VP Temperature"),
+            (top_p,       "VP Top-p"),
+            (top_k,       "VP Top-k"),
+            (max_tokens,  "VP Max Tokens"),
+        ]
 
-    def process(self, p, enabled, api_url, model_name, api_key, *args):
+        stride = IMAGES_PER_SLOT + 2
+        for i in range(4):
+            base = i * stride
+            self.infotext_fields += [
+                (tabs_data[base + IMAGES_PER_SLOT],     f"VP Slot {i+1} System Prompt"),
+                (tabs_data[base + IMAGES_PER_SLOT + 1], f"VP Slot {i+1} Weight"),
+            ]
+
+        self.paste_field_names = [label for _, label in self.infotext_fields]
+
+        return [enabled, api_url, model_name, api_key, temperature, top_p, top_k, max_tokens] + tabs_data
+
+    def process(self, p, enabled, api_url, model_name, api_key, temperature, top_p, top_k, max_tokens, *args):
         if not enabled:
             return
+
+        # ── Write settings to PNG metadata ────────────────────────────────
+        p.extra_generation_params.update({
+            "VP Enabled":     enabled,
+            "VP API URL":     api_url,
+            "VP Model":       model_name,
+            "VP Temperature": temperature,
+            "VP Top-p":       top_p,
+            "VP Top-k":       top_k,
+            "VP Max Tokens":  max_tokens,
+        })
+
+        stride = IMAGES_PER_SLOT + 2
+        for i in range(4):
+            base = i * stride
+            p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + IMAGES_PER_SLOT]
+            p.extra_generation_params[f"VP Slot {i+1} Weight"]        = args[base + IMAGES_PER_SLOT + 1]
 
         combined_prompts = []
 
@@ -255,7 +350,15 @@ class VisionPromptScript(scripts.Script):
 
             # ── Cache key: hash all source images + prompt + model ─────────
             hash_parts = b"".join(self._pil_to_bytes(img) for img in valid_images)
-            hash_input = hash_parts + system_prompt.encode("utf-8") + model_name.encode("utf-8")
+            param_str = f"{temperature}|{top_p}|{top_k}|{max_tokens}"
+
+            hash_input = (
+                hash_parts
+                + system_prompt.encode("utf-8")
+                + model_name.encode("utf-8")
+                + api_url.encode("utf-8")
+                + param_str.encode("utf-8")
+            )
             cache_key  = hashlib.sha256(hash_input).hexdigest()
 
             slot_cache = VISION_CACHE[slot_idx]
@@ -270,6 +373,9 @@ class VisionPromptScript(scripts.Script):
 
                 payload = {
                     "model": model_name,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {
@@ -285,8 +391,9 @@ class VisionPromptScript(scripts.Script):
                             ]
                         }
                     ],
-                    "max_tokens": 512
                 }
+                if top_k > 0:
+                    payload["top_k"] = top_k
 
                 try:
                     headers = {"Content-Type": "application/json"}
