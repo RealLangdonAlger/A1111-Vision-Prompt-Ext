@@ -179,10 +179,31 @@ class VisionPromptScript(scripts.Script):
 
             print(f"\n[Vision Prompt][Slot {slot_idx+1}] {stitch_desc}")
 
-            # ── Encode composed image to PNG bytes ─────────────────────────
-            buffered = io.BytesIO()
-            composed.save(buffered, format="PNG")
-            img_bytes = buffered.getvalue()
+            # ── Resize + compress before encoding ─────────────────────────
+            # Most vision APIs cap payloads at a few MB. Downscale to fit,
+            # then encode as JPEG (much smaller than PNG for photos).
+            MAX_LONG_EDGE = 4096  # matches OpenAI's "low detail" threshold
+            MAX_BYTES     = 4 * 1024 * 1024  # 4 MB hard cap
+
+            send_img = composed.copy()
+            if max(send_img.size) > MAX_LONG_EDGE:
+                send_img.thumbnail((MAX_LONG_EDGE, MAX_LONG_EDGE), Image.LANCZOS)
+
+            # Try JPEG at decreasing quality until under the byte cap
+            jpeg_quality = 90
+            while True:
+                buffered = io.BytesIO()
+                send_img.convert("RGB").save(buffered, format="JPEG", quality=jpeg_quality)
+                img_bytes = buffered.getvalue()
+                if len(img_bytes) <= MAX_BYTES or jpeg_quality <= 30:
+                    break
+                jpeg_quality -= 10
+
+            print(
+                f"[Vision Prompt][Slot {slot_idx+1}] "
+                f"Sending {send_img.size[0]}×{send_img.size[1]}px JPEG "
+                f"@ quality={jpeg_quality} ({len(img_bytes)//1024} KB)"
+            )
 
             # ── Cache key: hash all source images + prompt + model ─────────
             hash_parts = b"".join(self._pil_to_bytes(img) for img in valid_images)
@@ -208,7 +229,7 @@ class VisionPromptScript(scripts.Script):
                                 {
                                     "type": "image_url",
                                     "image_url": {
-                                        "url": f"data:image/png;base64,{img_base64}"
+                                        "url": f"data:image/jpeg;base64,{img_base64}"
                                     }
                                 }
                             ]
