@@ -12,10 +12,10 @@ from modules.processing import StableDiffusionProcessing
 
 import hashlib
 
-VISION_CACHE = [{} for _ in range(4)]  # one dict per slot, max 5 entries each
+VISION_CACHE = [{} for _ in range(3)]  # one dict per slot, max 5 entries each
 
 # How many image drop zones to show per slot
-IMAGES_PER_SLOT = 4
+IMAGES_PER_SLOT = 3
 
 # Seconds to wait for a vision API response before giving up
 TIMEOUT_SECONDS = 30
@@ -32,7 +32,6 @@ def load_presets():
         return {"Custom": ""}
 
 SYSTEM_PROMPT_PRESETS = load_presets()
-
 
 def _write_presets():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +54,6 @@ def delete_preset(name: str):
     _write_presets()
     choices = list(SYSTEM_PROMPT_PRESETS.keys())
     return gr.update(choices=choices, value="Custom"), "Custom"
-
 
 def stitch_images_horizontal(images: list, gap: int = 0) -> Image.Image:
     """
@@ -85,6 +83,86 @@ def stitch_images_horizontal(images: list, gap: int = 0) -> Image.Image:
 
     return canvas
 
+def apply_mask(image: Image.Image, editor_value: dict, mask_mode: str):
+    """
+    Apply a mask from a gr.ImageEditor value to a plain PIL image.
+
+    mask_mode "exclude"  — painted areas replaced with grey (LLM ignores them)
+    mask_mode "include"  — unpainted areas replaced with grey (LLM focuses only on painted)
+    mask_mode "none"     — no masking, image returned as-is
+
+    Returns the (possibly modified) RGB image, or None if image is None.
+    """
+    import numpy as np
+
+    if image is None:
+        return None
+
+    if mask_mode == "none" or editor_value is None:
+        return image.convert("RGB")
+
+    # Extract drawn strokes from all layers into a single mask
+    combined_mask = Image.new("L", image.size, 0)
+    for layer in (editor_value.get("layers") or []):
+        if layer is None:
+            continue
+        if not isinstance(layer, Image.Image):
+            layer = Image.fromarray(layer)
+        layer_rgba = layer.convert("RGBA").resize(image.size, Image.LANCZOS)
+        combined_mask = Image.fromarray(
+            np.maximum(
+                np.array(combined_mask),
+                np.array(layer_rgba.split()[3])
+            )
+        )
+
+    neutral = Image.new("RGB", image.size, (0, 0, 0))
+    base    = image.convert("RGB")
+
+    if mask_mode == "exclude":
+        result = base.copy()
+        result.paste(neutral, mask=combined_mask)
+    else:  # include
+        inverted = Image.fromarray(255 - np.array(combined_mask))
+        result = base.copy()
+        result.paste(neutral, mask=inverted)
+
+    return result
+
+def render_mask_preview(image: Image.Image, editor_value: dict) -> Image.Image | None:
+    """
+    Returns the original image with red mask strokes blended on top at 50% opacity.
+    Used purely for display — not sent to the API.
+    """
+    import numpy as np
+
+    if image is None or editor_value is None:
+        return image
+
+    combined_mask = Image.new("L", image.size, 0)
+    for layer in (editor_value.get("layers") or []):
+        if layer is None:
+            continue
+        if not isinstance(layer, Image.Image):
+            layer = Image.fromarray(layer)
+        layer_rgba = layer.convert("RGBA").resize(image.size, Image.LANCZOS)
+        combined_mask = Image.fromarray(
+            np.maximum(
+                np.array(combined_mask),
+                np.array(layer_rgba.split()[3])
+            )
+        )
+
+    if not np.any(np.array(combined_mask)):
+        return image  # no strokes drawn, return original
+
+    overlay     = Image.new("RGB", image.size, (220, 50, 50))
+    base        = image.convert("RGB")
+    # Scale mask to 50% opacity for the overlay blend
+    blend_mask  = Image.fromarray((np.array(combined_mask) * 0.55).astype(np.uint8))
+    preview     = base.copy()
+    preview.paste(overlay, mask=blend_mask)
+    return preview
 
 class VisionPromptScript(scripts.Script):
 
@@ -114,6 +192,28 @@ class VisionPromptScript(scripts.Script):
                 padding: 4px;
                 margin: 0px;
             }
+            /* Constrain mask editor canvas to viewport so it never overflows */
+            [id^="vp_mask_editor_"] .image-editor-container,
+            [id^="vp_mask_editor_"] canvas {
+                max-height: 50vh !important;
+                object-fit: contain !important;
+            }
+
+            [id^="vp_mask_editor_"] .image-editor {
+                max-height: 50vh !important;
+                overflow: hidden !important;
+            }
+
+            /* Style for checkbox in tab label */
+            .tab-checkbox {
+                display: inline-block;
+                margin-left: 8px;
+                vertical-align: middle;
+            }
+            .tab-checkbox input[type="checkbox"] {
+                margin: 0;
+                vertical-align: middle;
+            }
             </style>
             """)
         with gr.Accordion("Vision Prompt", open=False):
@@ -123,7 +223,7 @@ class VisionPromptScript(scripts.Script):
                 label="API URL",
                 value="http://localhost:8000/v1/chat/completions"
             )
-            
+
             api_key = gr.Textbox(
                 label="API Key",
                 value="",
@@ -135,7 +235,7 @@ class VisionPromptScript(scripts.Script):
                 label="Model",
                 value="gpt-4o-mini"
             )
-            
+
             with gr.Row(elem_classes="vp-params-box"):
                 temperature = gr.Slider(
                     label="Temperature",
@@ -160,7 +260,7 @@ class VisionPromptScript(scripts.Script):
                     value=0,
                     step=1
                 )
-                
+
                 max_tokens = gr.Slider(
                     label="Max Tokens",
                     minimum=16,
@@ -172,8 +272,19 @@ class VisionPromptScript(scripts.Script):
             tabs_data = []
 
             with gr.Tabs():
-                for i in range(4):
-                    with gr.Tab(f"Slot {i+1}"):
+                for i in range(3):  # Changed from 4 to 3 slots
+                    # Create tab with checkbox in label
+                    with gr.Tab(f"Vision Input #{i+1}") as tab:
+                        # Add a row at the top with the enable checkbox
+                        with gr.Row():
+                            slot_enabled = gr.Checkbox(
+                                label="Enable",
+                                value=True,
+                                scale=0,
+                                min_width=80
+                            )
+                            # Spacer to push content to the right
+                            gr.HTML("<div style='flex-grow: 1;'></div>")
 
                         # ── Multiple image drop zones ──────────────────────
                         gr.Markdown(
@@ -181,16 +292,150 @@ class VisionPromptScript(scripts.Script):
                             "stitched side-by-side before being sent to the vision model."
                         )
 
-                        image_inputs = []
+                        image_inputs    = []
+                        mask_states     = []
+                        original_states = []
+                        edit_buttons    = []
+                        mask_modes      = []  # Per-image mask mode states
+
                         with gr.Row(elem_classes="vp-image-box"):
                             for j in range(IMAGES_PER_SLOT):
-                                img_input = gr.Image(
-                                    type="pil",
-                                    label=f"Image {j+1}",
-                                    height=192,
-                                    elem_classes="vp-image-box"
-                                )
+                                with gr.Column(min_width=120):
+                                    img_input = gr.Image(
+                                        type="pil",
+                                        label=f"Image {j+1}",
+                                        height=256,
+                                        elem_classes="vp-image-box",
+                                    )
+                                    edit_btn = gr.Button("✏️ Mask", size="sm", min_width=60)
+
+                                    # Per-image mask mode selector (initially hidden)
+                                    mask_mode_radio = gr.Radio(
+                                        label="Mask mode",
+                                        choices=["none", "exclude", "include"],
+                                        value="include",
+                                        visible=False,
+                                    )
+
                                 image_inputs.append(img_input)
+                                mask_states.append(gr.State(None))
+                                original_states.append(gr.State(None))
+                                edit_buttons.append(edit_btn)
+                                mask_modes.append(gr.State("include"))
+
+                        # One shared ImageEditor per slot — hidden until a Mask button is clicked
+                        with gr.Group(visible=False) as mask_editor_group:
+                            gr.Markdown("**Draw over areas to mask (red brush)**")
+                            mask_editor = gr.ImageEditor(
+                                label="Mask Editor",
+                                brush=gr.Brush(colors=["#ff0000"], default_size=64, color_mode="fixed"),
+                                eraser=gr.Eraser(),
+                                layers=False,
+                                type="pil",
+                                elem_id=f"vp_mask_editor_{i}",
+                            )
+                            with gr.Row():
+                                apply_mask_btn = gr.Button("✅ Apply mask", variant="primary")
+                                clear_mask_btn = gr.Button("🗑️ Clear mask")
+                                close_mask_btn = gr.Button("✖ Close")
+                            active_mask_idx = gr.State(-1)
+
+                            # Shared mask_mode for editor (synced with active image's mode)
+                            mask_mode = gr.Radio(
+                                label="Mask mode",
+                                choices=["none", "exclude", "include"],
+                                value="include",
+                            )
+
+                        # Open editor: load image into editor and save original + sync mask_mode
+                        for j in range(IMAGES_PER_SLOT):
+                            def open_editor(img, _j=j):
+                                if img is None:
+                                    return (
+                                        gr.update(),
+                                        gr.update(visible=False),
+                                        _j,
+                                        None,
+                                        gr.update(),  # mask_mode update
+                                    )
+                                # Get current mask_mode for this image from state
+                                current_mode = mask_modes[_j].value if mask_modes[_j].value else "include"
+                                return (
+                                    gr.update(value={
+                                        "background": img,
+                                        "layers": [],
+                                        "composite": img,
+                                    }),
+                                    gr.update(visible=True),
+                                    _j,
+                                    img,  # saved into original_states[j]
+                                    gr.update(value=current_mode),  # Sync editor's mask_mode
+                                )
+                            edit_buttons[j].click(
+                                fn=open_editor,
+                                inputs=[image_inputs[j]],
+                                outputs=[mask_editor, mask_editor_group, active_mask_idx, original_states[j], mask_mode],
+                            )
+
+                        # Apply: save mask state, mask_mode, and composite preview onto the upload zone in-place
+                        def do_apply_mask(editor_val, idx, current_mask_mode, *states):
+                            # states = [orig0..N, mask0..N, mode0..N]
+                            originals = list(states[:IMAGES_PER_SLOT])
+                            masks     = list(states[IMAGES_PER_SLOT:IMAGES_PER_SLOT*2])
+                            modes     = list(states[IMAGES_PER_SLOT*2:])
+
+                            if 0 <= idx < len(masks):
+                                masks[idx] = editor_val
+                                modes[idx] = current_mask_mode  # Save the mode
+
+                            image_updates = []
+                            mode_updates = []
+                            for k in range(IMAGES_PER_SLOT):
+                                if k == idx and editor_val is not None and originals[k] is not None:
+                                    image_updates.append(gr.update(value=render_mask_preview(originals[k], editor_val)))
+                                    mode_updates.append(gr.update(value=current_mask_mode, visible=True))
+                                else:
+                                    image_updates.append(gr.update())
+                                    mode_updates.append(gr.update())
+
+                            return [gr.update(visible=False)] + masks + modes + image_updates
+
+                        apply_mask_btn.click(
+                            fn=do_apply_mask,
+                            inputs=[mask_editor, active_mask_idx, mask_mode] + original_states + mask_states + mask_modes,
+                            outputs=[mask_editor_group] + mask_states + mask_modes + image_inputs,
+                        )
+
+                        # Clear: wipe mask state, mode, and restore original image to upload zone
+                        def do_clear_mask(idx, *states):
+                            originals = list(states[:IMAGES_PER_SLOT])
+                            masks     = list(states[IMAGES_PER_SLOT:IMAGES_PER_SLOT*2])
+                            modes     = list(states[IMAGES_PER_SLOT*2:])
+
+                            if 0 <= idx < len(masks):
+                                masks[idx] = None
+                                modes[idx] = "include"  # Reset to default
+
+                            image_updates = [
+                                gr.update(value=originals[k]) if k == idx else gr.update()
+                                for k in range(IMAGES_PER_SLOT)
+                            ]
+                            mode_updates = [
+                                gr.update(value="include", visible=False) if k == idx else gr.update()
+                                for k in range(IMAGES_PER_SLOT)
+                            ]
+                            return [gr.update(value=None)] + masks + modes + image_updates + mode_updates
+
+                        clear_mask_btn.click(
+                            fn=do_clear_mask,
+                            inputs=[active_mask_idx] + original_states + mask_states + mask_modes,
+                            outputs=[mask_editor] + mask_states + mask_modes + image_inputs + [m for m in mask_modes],  # Update all mode radios
+                        )
+
+                        close_mask_btn.click(
+                            fn=lambda: gr.update(visible=False),
+                            outputs=[mask_editor_group],
+                        )
 
                         # ── Preset / system prompt ─────────────────────────
                         gr.Markdown("**Preset**")
@@ -244,8 +489,12 @@ class VisionPromptScript(scripts.Script):
                             step=0.05
                         )
 
-                        # Pack: [img0, img1, img2, img3, system_prompt, weight]
+                        # Pack: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
+                        tabs_data.append(slot_enabled)
                         tabs_data.extend(image_inputs)
+                        tabs_data.extend(original_states)
+                        tabs_data.extend(mask_states)
+                        tabs_data.extend(mask_modes)
                         tabs_data.extend([system_prompt, weight])
 
         # ── Persistent settings & PNG metadata ────────────────────────────
@@ -261,12 +510,18 @@ class VisionPromptScript(scripts.Script):
             (max_tokens,  "VP Max Tokens"),
         ]
 
-        stride = IMAGES_PER_SLOT + 2
-        for i in range(4):
-            base = i * stride
+        # Slot layout: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
+        SLOT_STRIDE       = 1 + IMAGES_PER_SLOT * 4 + 2  # 1 for slot_enabled + images + modes + system_prompt + weight
+        SLOT_ENABLED_OFF  = 0
+        SYSTEM_PROMPT_OFF = 1 + IMAGES_PER_SLOT * 4
+        WEIGHT_OFF        = 1 + IMAGES_PER_SLOT * 4 + 1
+
+        for i in range(3):
+            base = i * SLOT_STRIDE
             self.infotext_fields += [
-                (tabs_data[base + IMAGES_PER_SLOT],     f"VP Slot {i+1} System Prompt"),
-                (tabs_data[base + IMAGES_PER_SLOT + 1], f"VP Slot {i+1} Weight"),
+                (tabs_data[base + SLOT_ENABLED_OFF],  f"VP Slot {i+1} Enabled"),
+                (tabs_data[base + SYSTEM_PROMPT_OFF], f"VP Slot {i+1} System Prompt"),
+                (tabs_data[base + WEIGHT_OFF],        f"VP Slot {i+1} Weight"),
             ]
 
         self.paste_field_names = [label for _, label in self.infotext_fields]
@@ -288,26 +543,45 @@ class VisionPromptScript(scripts.Script):
             "VP Max Tokens":  max_tokens,
         })
 
-        stride = IMAGES_PER_SLOT + 2
-        for i in range(4):
-            base = i * stride
-            p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + IMAGES_PER_SLOT]
-            p.extra_generation_params[f"VP Slot {i+1} Weight"]        = args[base + IMAGES_PER_SLOT + 1]
+        # Slot layout: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
+        SLOT_STRIDE       = 1 + IMAGES_PER_SLOT * 4 + 2  # 1 for slot_enabled + images + modes + system_prompt + weight
+        SLOT_ENABLED_OFF  = 0
+        ORIG_OFF          = 1 + IMAGES_PER_SLOT
+        MASK_OFF          = 1 + IMAGES_PER_SLOT * 2
+        MODE_OFF          = 1 + IMAGES_PER_SLOT * 3
+        SYSTEM_PROMPT_OFF = 1 + IMAGES_PER_SLOT * 4
+        WEIGHT_OFF        = 1 + IMAGES_PER_SLOT * 4 + 1
+
+        for i in range(3):
+            base = i * SLOT_STRIDE
+            p.extra_generation_params[f"VP Slot {i+1} Enabled"] = args[base + SLOT_ENABLED_OFF]
+            p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + SYSTEM_PROMPT_OFF]
+            p.extra_generation_params[f"VP Slot {i+1} Weight"] = args[base + WEIGHT_OFF]
 
         combined_prompts = []
 
-        # args layout per slot: [img0, img1, img2, img3, system_prompt, weight]
-        stride = IMAGES_PER_SLOT + 2  # +2 for system_prompt and weight
+        for slot_idx in range(3):
+            base = slot_idx * SLOT_STRIDE
 
-        for slot_idx in range(4):
-            base = slot_idx * stride
+            # Check if this slot is enabled
+            slot_enabled = args[base + SLOT_ENABLED_OFF]
+            if not slot_enabled:
+                continue
 
-            slot_images   = [args[base + j] for j in range(IMAGES_PER_SLOT)]
-            system_prompt = args[base + IMAGES_PER_SLOT]
-            weight        = args[base + IMAGES_PER_SLOT + 1]
+            slot_images = [args[base + 1 + j]            for j in range(IMAGES_PER_SLOT)]
+            slot_origs  = [args[base + ORIG_OFF + j]     for j in range(IMAGES_PER_SLOT)]
+            slot_masks  = [args[base + MASK_OFF + j]     for j in range(IMAGES_PER_SLOT)]
+            slot_modes  = [args[base + MODE_OFF + j]     for j in range(IMAGES_PER_SLOT)]
+            system_prompt = args[base + SYSTEM_PROMPT_OFF]
+            weight        = args[base + WEIGHT_OFF]
 
-            # Drop empty upload zones
-            valid_images = [img for img in slot_images if img is not None]
+            # Apply masks with per-image modes
+            valid_images = []
+            for img, orig, mask_val, mask_mode in zip(slot_images, slot_origs, slot_masks, slot_modes):
+                source = orig if orig is not None else img
+                result = apply_mask(source, mask_val, mask_mode)  # Use per-image mode
+                if result is not None:
+                    valid_images.append(result)
 
             if not valid_images:
                 continue
@@ -352,12 +626,15 @@ class VisionPromptScript(scripts.Script):
             hash_parts = b"".join(self._pil_to_bytes(img) for img in valid_images)
             param_str = f"{temperature}|{top_p}|{top_k}|{max_tokens}"
 
+            # Include all per-image mask modes in cache key
+            mask_modes_str = "|".join(slot_modes)
             hash_input = (
                 hash_parts
                 + system_prompt.encode("utf-8")
                 + model_name.encode("utf-8")
                 + api_url.encode("utf-8")
                 + param_str.encode("utf-8")
+                + mask_modes_str.encode("utf-8")
             )
             cache_key  = hashlib.sha256(hash_input).hexdigest()
 
@@ -414,7 +691,7 @@ class VisionPromptScript(scripts.Script):
                     print(msg)
                     continue
                 except Exception as e:
-                    msg = f"[Vision Prompt] Slot {slot_idx+1}: API error: {e}"
+                    msg = f"[Vision Prompt]Slot {slot_idx+1}: API error: {e}"
                     print(msg)
                     continue
 
