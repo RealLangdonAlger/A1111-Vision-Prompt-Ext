@@ -12,13 +12,10 @@ from modules.processing import StableDiffusionProcessing
 
 import hashlib
 
-VISION_CACHE = [{} for _ in range(3)]  # one dict per slot, max 5 entries each
+VISION_CACHE = [{} for _ in range(3)]  # one dict per slot
 
 # How many image drop zones to show per slot
 IMAGES_PER_SLOT = 3
-
-# Seconds to wait for a vision API response before giving up
-TIMEOUT_SECONDS = 30
 
 def load_presets():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -217,7 +214,16 @@ class VisionPromptScript(scripts.Script):
             </style>
             """)
         with gr.Accordion("Vision Prompt", open=False):
-            enabled = gr.Checkbox(label="Enable Vision Prompt", value=False)
+            with gr.Row():
+                enabled = gr.Checkbox(
+                    label="Enable Vision Prompt", 
+                    value=False)
+
+                always_regenerate = gr.Checkbox(
+                    label="Always Re-Generate (Skip Cache)",
+                    value=False
+                )
+                gr.HTML("<div style='flex-grow: 1;'></div>")
 
             api_url = gr.Textbox(
                 label="API URL",
@@ -236,38 +242,70 @@ class VisionPromptScript(scripts.Script):
                 value="gpt-4o-mini"
             )
 
-            with gr.Row(elem_classes="vp-params-box"):
-                temperature = gr.Slider(
-                    label="Temperature",
-                    minimum=0.0,
-                    maximum=2.0,
-                    value=0.7,
-                    step=0.05
-                )
+            with gr.Accordion("Advanced Settings", open=False, elem_classes="vp-params-box"):
+                with gr.Row():
+                    temperature = gr.Slider(
+                        label="Temperature",
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=0.7,
+                        step=0.05
+                    )
 
-                top_p = gr.Slider(
-                    label="Top-p",
-                    minimum=0.0,
-                    maximum=1.0,
-                    value=1.0,
-                    step=0.05
-                )
+                    top_p = gr.Slider(
+                        label="Top-p",
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=1.0,
+                        step=0.05
+                    )
 
-                top_k = gr.Slider(
-                    label="Top-k",
-                    minimum=0,
-                    maximum=100,
-                    value=0,
-                    step=1
-                )
+                    top_k = gr.Slider(
+                        label="Top-k",
+                        minimum=0,
+                        maximum=100,
+                        value=0,
+                        step=1
+                    )
 
-                max_tokens = gr.Slider(
-                    label="Max Tokens",
-                    minimum=16,
-                    maximum=1024,
-                    value=256,
-                    step=16
-                )
+                    max_tokens = gr.Slider(
+                        label="Max Tokens",
+                        minimum=16,
+                        maximum=8192,
+                        value=512,
+                        step=16
+                    )
+
+                with gr.Row():
+                    timeout_seconds = gr.Slider(
+                        label="Request Timeout (seconds)",
+                        minimum=5,
+                        maximum=120,
+                        value=30,
+                        step=1
+                    )
+
+                    cache_size = gr.Slider(
+                        label="Cache Size (per slot)",
+                        minimum=1,
+                        maximum=50,
+                        value=10,
+                        step=1
+                    )
+					
+                with gr.Row():
+                    write_png_meta = gr.Checkbox(
+                        label="Write settings to PNG metadata",
+                        value=False,
+                        info="When enabled, VP settings and system prompts are embedded in the output PNG. Disable to keep metadata clean."
+                    )
+                    
+                    reasoning_budget = gr.Dropdown(
+                        label="",
+                        choices=["none", "low", "medium", "high"],
+                        value="none",
+                        info="Only for models that support reasoning! Set Max Tokens to at least 1024 for this to work properly."
+                    )
 
             tabs_data = []
 
@@ -349,7 +387,7 @@ class VisionPromptScript(scripts.Script):
 
                         # Open editor: load image into editor and save original + sync mask_mode
                         for j in range(IMAGES_PER_SLOT):
-                            def open_editor(img, _j=j):
+                            def open_editor(img, current_mode, _j=j):
                                 if img is None:
                                     return (
                                         gr.update(),
@@ -358,8 +396,9 @@ class VisionPromptScript(scripts.Script):
                                         None,
                                         gr.update(),  # mask_mode update
                                     )
-                                # Get current mask_mode for this image from state
-                                current_mode = mask_modes[_j].value if mask_modes[_j].value else "include"
+                                # current_mode is passed in as a proper Gradio state value
+                                if not current_mode:
+                                    current_mode = "include"
                                 return (
                                     gr.update(value={
                                         "background": img,
@@ -373,8 +412,22 @@ class VisionPromptScript(scripts.Script):
                                 )
                             edit_buttons[j].click(
                                 fn=open_editor,
-                                inputs=[image_inputs[j]],
+                                inputs=[image_inputs[j], mask_modes[j]],
                                 outputs=[mask_editor, mask_editor_group, active_mask_idx, original_states[j], mask_mode],
+                            )
+
+                        # Reset mask/original/mode state whenever a new image is dropped in
+                        for j in range(IMAGES_PER_SLOT):
+                            def on_image_change(new_img, _j=j):
+                                # Returns: original_state, mask_state, mask_mode_state, mask_mode_radio update
+                                if new_img is None:
+                                    return None, None, "include", gr.update(value="include", visible=False)
+                                # New image — clear stale mask data so the fresh image is used
+                                return new_img, None, "include", gr.update(value="include", visible=False)
+                            image_inputs[j].change(
+                                fn=on_image_change,
+                                inputs=[image_inputs[j]],
+                                outputs=[original_states[j], mask_states[j], mask_modes[j], mask_mode],
                             )
 
                         # Apply: save mask state, mask_mode, and composite preview onto the upload zone in-place
@@ -500,14 +553,15 @@ class VisionPromptScript(scripts.Script):
         # ── Persistent settings & PNG metadata ────────────────────────────
         # Stable label strings become keys in PNG infotext.
         # api_key intentionally excluded — never write secrets to metadata.
+        # write_png_meta controls whether any of these are actually written at generation time.
         self.infotext_fields = [
-            (enabled,     "VP Enabled"),
-            (api_url,     "VP API URL"),
-            (model_name,  "VP Model"),
-            (temperature, "VP Temperature"),
-            (top_p,       "VP Top-p"),
-            (top_k,       "VP Top-k"),
-            (max_tokens,  "VP Max Tokens"),
+            (enabled,        "VP Enabled"),
+            (api_url,        "VP API URL"),
+            (model_name,     "VP Model"),
+            (temperature,    "VP Temperature"),
+            (top_p,          "VP Top-p"),
+            (top_k,          "VP Top-k"),
+            (max_tokens,     "VP Max Tokens"),
         ]
 
         # Slot layout: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
@@ -526,22 +580,29 @@ class VisionPromptScript(scripts.Script):
 
         self.paste_field_names = [label for _, label in self.infotext_fields]
 
-        return [enabled, api_url, model_name, api_key, temperature, top_p, top_k, max_tokens] + tabs_data
+        return [
+            enabled, api_url, model_name, api_key,
+            temperature, top_p, top_k, max_tokens,
+            timeout_seconds, cache_size,
+            always_regenerate, write_png_meta,
+            reasoning_budget,
+        ] + tabs_data
 
-    def process(self, p, enabled, api_url, model_name, api_key, temperature, top_p, top_k, max_tokens, *args):
+    def process(self, p, enabled, api_url, model_name, api_key, temperature, top_p, top_k, max_tokens, timeout_seconds, cache_size, always_regenerate, write_png_meta, reasoning_budget, *args):
         if not enabled:
             return
 
         # ── Write settings to PNG metadata ────────────────────────────────
-        p.extra_generation_params.update({
-            "VP Enabled":     enabled,
-            "VP API URL":     api_url,
-            "VP Model":       model_name,
-            "VP Temperature": temperature,
-            "VP Top-p":       top_p,
-            "VP Top-k":       top_k,
-            "VP Max Tokens":  max_tokens,
-        })
+        if write_png_meta:
+            p.extra_generation_params.update({
+                "VP Enabled":     enabled,
+                "VP API URL":     api_url,
+                "VP Model":       model_name,
+                "VP Temperature": temperature,
+                "VP Top-p":       top_p,
+                "VP Top-k":       top_k,
+                "VP Max Tokens":  max_tokens,
+            })
 
         # Slot layout: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
         SLOT_STRIDE       = 1 + IMAGES_PER_SLOT * 4 + 2  # 1 for slot_enabled + images + modes + system_prompt + weight
@@ -554,9 +615,10 @@ class VisionPromptScript(scripts.Script):
 
         for i in range(3):
             base = i * SLOT_STRIDE
-            p.extra_generation_params[f"VP Slot {i+1} Enabled"] = args[base + SLOT_ENABLED_OFF]
-            p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + SYSTEM_PROMPT_OFF]
-            p.extra_generation_params[f"VP Slot {i+1} Weight"] = args[base + WEIGHT_OFF]
+            if write_png_meta:
+                p.extra_generation_params[f"VP Slot {i+1} Enabled"] = args[base + SLOT_ENABLED_OFF]
+                p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + SYSTEM_PROMPT_OFF]
+                p.extra_generation_params[f"VP Slot {i+1} Weight"] = args[base + WEIGHT_OFF]
 
         combined_prompts = []
 
@@ -624,7 +686,7 @@ class VisionPromptScript(scripts.Script):
 
             # ── Cache key: hash all source images + prompt + model ─────────
             hash_parts = b"".join(self._pil_to_bytes(img) for img in valid_images)
-            param_str = f"{temperature}|{top_p}|{top_k}|{max_tokens}"
+            param_str = f"{temperature}|{top_p}|{top_k}|{max_tokens}|{reasoning_budget}"
 
             # Include all per-image mask modes in cache key
             mask_modes_str = "|".join(slot_modes)
@@ -640,11 +702,14 @@ class VisionPromptScript(scripts.Script):
 
             slot_cache = VISION_CACHE[slot_idx]
 
-            if cache_key in slot_cache:
+            if not always_regenerate and cache_key in slot_cache:
                 vision_output = slot_cache[cache_key]
                 print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
             else:
-                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
+                if always_regenerate and cache_key in slot_cache:
+                    print(f"[Vision Prompt][Slot {slot_idx+1}] Cache bypassed (Always Re-Generate) — calling API")
+                else:
+                    print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
 
                 img_base64 = base64.b64encode(img_bytes).decode("utf-8")
 
@@ -672,22 +737,32 @@ class VisionPromptScript(scripts.Script):
                 if top_k > 0:
                     payload["top_k"] = top_k
 
+                _reasoning_budget_map = {
+					"none": 0,
+                    "low":    int(max_tokens * 0.2),
+                    "medium": int(max_tokens * 0.5),
+                    "high":  int(max_tokens * 0.8),
+                }
+                if reasoning_budget in _reasoning_budget_map:
+                    payload["reasoning_effort"] = reasoning_budget
+                    payload["thinking_budget_tokens"] = _reasoning_budget_map[reasoning_budget]
+
                 try:
                     headers = {"Content-Type": "application/json"}
                     if api_key and api_key.strip():
                         headers["Authorization"] = f"Bearer {api_key.strip()}"
-                    response = requests.post(api_url, json=payload, headers=headers, timeout=TIMEOUT_SECONDS)
+                    response = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
                     response.raise_for_status()
                     data = response.json()
                     vision_output = data["choices"][0]["message"]["content"]
 
                     # Evict oldest entry if at capacity
-                    if len(slot_cache) >= 5:
+                    if len(slot_cache) >= cache_size:
                         oldest_key = next(iter(slot_cache))
                         del slot_cache[oldest_key]
                     slot_cache[cache_key] = vision_output
                 except requests.exceptions.Timeout:
-                    msg = f"[Vision Prompt] Slot {slot_idx+1}: Request timed out after {TIMEOUT_SECONDS}s"
+                    msg = f"[Vision Prompt] Slot {slot_idx+1}: Request timed out after {timeout_seconds}s"
                     print(msg)
                     continue
                 except Exception as e:
@@ -697,7 +772,7 @@ class VisionPromptScript(scripts.Script):
 
             if not vision_output:
                 continue
-
+            
             vision_output   = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
             weighted_prompt = f"({vision_output}:{weight})"
 
