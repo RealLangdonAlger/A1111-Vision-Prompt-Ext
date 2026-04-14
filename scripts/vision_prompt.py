@@ -219,28 +219,25 @@ class VisionPromptScript(scripts.Script):
                     label="Enable Vision Prompt", 
                     value=False)
 
-                always_regenerate = gr.Checkbox(
-                    label="Always Re-Generate (Skip Cache)",
-                    value=False
+            with gr.Row():
+                model_name = gr.Textbox(
+                    label="Model",
+                    value="gpt-4o-mini",
+                    scale=2
                 )
-                gr.HTML("<div style='flex-grow: 1;'></div>")
 
-            api_url = gr.Textbox(
-                label="API URL",
-                value="http://localhost:8000/v1/chat/completions"
-            )
-
-            api_key = gr.Textbox(
-                label="API Key",
-                value="",
-                placeholder="sk-... (leave blank for local endpoints)",
-                type="password"
-            )
-
-            model_name = gr.Textbox(
-                label="Model",
-                value="gpt-4o-mini"
-            )
+                api_url = gr.Textbox(
+                    label="API URL",
+                    value="http://localhost:8000/v1/chat/completions",
+                    scale=3
+                )
+                api_key = gr.Textbox(
+                    label="API Key",
+                    value="",
+                    placeholder="sk-... (leave blank for local endpoints)",
+                    type="password",
+                    scale=2
+                )
 
             with gr.Accordion("Advanced Settings", open=False, elem_classes="vp-params-box"):
                 with gr.Row():
@@ -294,17 +291,26 @@ class VisionPromptScript(scripts.Script):
                     )
 					
                 with gr.Row():
-                    write_png_meta = gr.Checkbox(
-                        label="Write settings to PNG metadata",
+                    always_regenerate = gr.Checkbox(
+                        label="Skip Cache",
                         value=False,
-                        info="When enabled, VP settings and system prompts are embedded in the output PNG. Disable to keep metadata clean."
+                        info="Always do a fresh API call.",
+                        scale=1
+                    )
+                    
+                    write_png_meta = gr.Checkbox(
+                        label="Store Infotext",
+                        value=False,
+                        info="Writes settings and system prompts to the PNG metadata.",
+                        scale=2
                     )
                     
                     reasoning_budget = gr.Dropdown(
-                        label="",
+                        label="Model Reasoning", show_label=False,
                         choices=["none", "low", "medium", "high"],
                         value="none",
-                        info="Only for models that support reasoning! Set Max Tokens to at least 1024 for this to work properly."
+                        info="Reasoning mode for models that support it. Needs Max Tokens >2048",
+                        scale=2
                     )
 
             tabs_data = []
@@ -316,18 +322,15 @@ class VisionPromptScript(scripts.Script):
                         # Add a row at the top with the enable checkbox
                         with gr.Row():
                             slot_enabled = gr.Checkbox(
-                                label="Enable",
+                                label="Enable slot",
                                 value=True,
                                 scale=0,
-                                min_width=80
+                                min_width=120
                             )
-                            # Spacer to push content to the right
-                            gr.HTML("<div style='flex-grow: 1;'></div>")
 
                         # ── Multiple image drop zones ──────────────────────
                         gr.Markdown(
-                            f"Upload up to **{IMAGES_PER_SLOT} images** — they will be "
-                            "stitched side-by-side before being sent to the vision model."
+                            f"Upload up to **{IMAGES_PER_SLOT} images** (auto-stitched left → right)"
                         )
 
                         image_inputs    = []
@@ -345,15 +348,15 @@ class VisionPromptScript(scripts.Script):
                                         height=256,
                                         elem_classes="vp-image-box",
                                     )
-                                    edit_btn = gr.Button("✏️ Mask", size="sm", min_width=60)
 
-                                    # Per-image mask mode selector (initially hidden)
-                                    mask_mode_radio = gr.Radio(
-                                        label="Mask mode",
-                                        choices=["none", "exclude", "include"],
-                                        value="include",
-                                        visible=False,
-                                    )
+                                    with gr.Row():
+                                        edit_btn = gr.Button("✏️ Mask", size="sm", min_width=40)
+                                        mask_mode_radio = gr.Radio(
+                                            choices=["exclude", "include"],
+                                            value="include",
+                                            visible=False,
+                                            scale=1
+                                        )
 
                                 image_inputs.append(img_input)
                                 mask_states.append(gr.State(None))
@@ -362,7 +365,7 @@ class VisionPromptScript(scripts.Script):
                                 mask_modes.append(gr.State("include"))
 
                         # One shared ImageEditor per slot — hidden until a Mask button is clicked
-                        with gr.Group(visible=False) as mask_editor_group:
+                        with gr.Group(visible=False, elem_classes="vp-params-box") as mask_editor_group:
                             gr.Markdown("**Draw over areas to mask (red brush)**")
                             mask_editor = gr.ImageEditor(
                                 label="Mask Editor",
@@ -380,9 +383,9 @@ class VisionPromptScript(scripts.Script):
 
                             # Shared mask_mode for editor (synced with active image's mode)
                             mask_mode = gr.Radio(
-                                label="Mask mode",
-                                choices=["none", "exclude", "include"],
-                                value="include",
+                                label="Mask behavior",
+                                choices=["exclude (hide painted)", "include (keep painted)"],
+                                value="include (keep painted)",
                             )
 
                         # Open editor: load image into editor and save original + sync mask_mode
@@ -482,7 +485,7 @@ class VisionPromptScript(scripts.Script):
                         clear_mask_btn.click(
                             fn=do_clear_mask,
                             inputs=[active_mask_idx] + original_states + mask_states + mask_modes,
-                            outputs=[mask_editor] + mask_states + mask_modes + image_inputs + [m for m in mask_modes],  # Update all mode radios
+                            outputs=[mask_editor] + mask_states + mask_modes + image_inputs
                         )
 
                         close_mask_btn.click(
@@ -491,19 +494,18 @@ class VisionPromptScript(scripts.Script):
                         )
 
                         # ── Preset / system prompt ─────────────────────────
-                        gr.Markdown("**Preset**")
+                        gr.Markdown("### Prompt Preset")
                         with gr.Row(equal_height=True):
                             preset_dropdown = gr.Dropdown(
                                 choices=list(SYSTEM_PROMPT_PRESETS.keys()),
                                 value="Custom",
-                                scale=2,
+                                scale=3,
                                 show_label=False
                             )
-
                             preset_name_input = gr.Textbox(
                                 placeholder="Preset name...",
                                 show_label=False,
-                                scale=1,
+                                scale=2,
                                 max_lines=1
                             )
 
@@ -535,7 +537,7 @@ class VisionPromptScript(scripts.Script):
                         )
 
                         weight = gr.Slider(
-                            label="Weight",
+                            label="Prompt Weight",
                             minimum=0.0,
                             maximum=2.0,
                             value=1.0,
