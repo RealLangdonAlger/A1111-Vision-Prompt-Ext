@@ -211,6 +211,12 @@ class VisionPromptScript(scripts.Script):
                 margin: 0;
                 vertical-align: middle;
             }
+            .bottom-align {
+                display: flex !important;
+                flex-direction: column !important;
+                margin-top: 8px !important;
+                vertical-align: top !important;
+            }
             </style>
             """)
         with gr.Accordion("Vision Prompt", open=False):
@@ -290,19 +296,21 @@ class VisionPromptScript(scripts.Script):
                         step=1
                     )
 					
-                with gr.Row():
+                with gr.Row(elem_id="reasoning-row"):
                     always_regenerate = gr.Checkbox(
                         label="Skip Cache",
                         value=False,
                         info="Always do a fresh API call.",
-                        scale=1
+                        scale=1,
+                        elem_classes=["bottom-align"]
                     )
                     
                     write_png_meta = gr.Checkbox(
                         label="Store Infotext",
                         value=False,
                         info="Writes settings and system prompts to the PNG metadata.",
-                        scale=2
+                        scale=2,
+                        elem_classes=["bottom-align"]
                     )
                     
                     reasoning_budget = gr.Dropdown(
@@ -310,7 +318,8 @@ class VisionPromptScript(scripts.Script):
                         choices=["none", "low", "medium", "high"],
                         value="none",
                         info="Reasoning mode for models that support it. Needs Max Tokens >2048",
-                        scale=2
+                        scale=2,
+                        elem_classes=["bottom-align"]
                     )
 
             tabs_data = []
