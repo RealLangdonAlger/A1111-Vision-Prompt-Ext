@@ -80,86 +80,143 @@ def stitch_images_horizontal(images: list, gap: int = 0) -> Image.Image:
 
     return canvas
 
-def apply_mask(image: Image.Image, editor_value: dict, mask_mode: str):
+# ── Shared API call helper ─────────────────────────────────────────────────────
+
+def _encode_image(img: Image.Image, max_long_edge: int = 4096, max_bytes: int = 4 * 1024 * 1024):
+    """Resize + JPEG-compress a PIL image and return (base64_str, width, height, quality, byte_len)."""
+    send_img = img.copy()
+    if max(send_img.size) > max_long_edge:
+        send_img.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)
+
+    jpeg_quality = 90
+    while True:
+        buffered = io.BytesIO()
+        send_img.convert("RGB").save(buffered, format="JPEG", quality=jpeg_quality)
+        img_bytes = buffered.getvalue()
+        if len(img_bytes) <= max_bytes or jpeg_quality <= 30:
+            break
+        jpeg_quality -= 10
+
+    return base64.b64encode(img_bytes).decode("utf-8"), send_img.size[0], send_img.size[1], jpeg_quality, len(img_bytes)
+
+def _call_vision_api(
+    img_b64: str,
+    system_prompt: str,
+    model_name: str,
+    api_url: str,
+    api_key: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    reasoning_budget: str,
+    timeout_seconds: int,
+    user_text: str = "",
+) -> str | None:
     """
-    Apply a mask from a gr.ImageEditor value to a plain PIL image.
-
-    mask_mode "exclude"  — painted areas replaced with grey (LLM ignores them)
-    mask_mode "include"  — unpainted areas replaced with grey (LLM focuses only on painted)
-    mask_mode "none"     — no masking, image returned as-is
-
-    Returns the (possibly modified) RGB image, or None if image is None.
+    Send one image (already base64-encoded) to the vision API.
+    Returns the raw string content or None on failure.
     """
-    import numpy as np
+    payload = {
+        "model": model_name,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                    }
+                ]
+            }
+        ],
+    }
+    if top_k > 0:
+        payload["top_k"] = top_k
 
-    if image is None:
+    _reasoning_budget_map = {
+        "none":   0,
+        "low":    int(max_tokens * 0.2),
+        "medium": int(max_tokens * 0.5),
+        "high":   int(max_tokens * 0.8),
+    }
+    if reasoning_budget in _reasoning_budget_map:
+        payload["reasoning_effort"] = reasoning_budget
+        payload["thinking_budget_tokens"] = _reasoning_budget_map[reasoning_budget]
+
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api_key and api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+        response = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        print(f"[Vision Prompt] Request timed out after {timeout_seconds}s")
+        return None
+    except Exception as e:
+        print(f"[Vision Prompt] API error: {e}")
         return None
 
-    if mask_mode == "none" or editor_value is None:
-        return image.convert("RGB")
-
-    # Extract drawn strokes from all layers into a single mask
-    combined_mask = Image.new("L", image.size, 0)
-    for layer in (editor_value.get("layers") or []):
-        if layer is None:
-            continue
-        if not isinstance(layer, Image.Image):
-            layer = Image.fromarray(layer)
-        layer_rgba = layer.convert("RGBA").resize(image.size, Image.LANCZOS)
-        combined_mask = Image.fromarray(
-            np.maximum(
-                np.array(combined_mask),
-                np.array(layer_rgba.split()[3])
-            )
-        )
-
-    neutral = Image.new("RGB", image.size, (0, 0, 0))
-    base    = image.convert("RGB")
-
-    if mask_mode == "exclude":
-        result = base.copy()
-        result.paste(neutral, mask=combined_mask)
-    else:  # include
-        inverted = Image.fromarray(255 - np.array(combined_mask))
-        result = base.copy()
-        result.paste(neutral, mask=inverted)
-
-    return result
-
-def render_mask_preview(image: Image.Image, editor_value: dict) -> Image.Image | None:
+def _call_text_api(
+    system_prompt: str,
+    user_text: str,
+    model_name: str,
+    api_url: str,
+    api_key: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    reasoning_budget: str,
+    timeout_seconds: int,
+) -> str | None:
     """
-    Returns the original image with red mask strokes blended on top at 50% opacity.
-    Used purely for display — not sent to the API.
+    Text-only API call used for the Merge Multicall merge step.
     """
-    import numpy as np
+    payload = {
+        "model": model_name,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_text},
+        ],
+    }
+    if top_k > 0:
+        payload["top_k"] = top_k
 
-    if image is None or editor_value is None:
-        return image
+    _reasoning_budget_map = {
+        "none":   0,
+        "low":    int(max_tokens * 0.2),
+        "medium": int(max_tokens * 0.5),
+        "high":   int(max_tokens * 0.8),
+    }
+    if reasoning_budget in _reasoning_budget_map:
+        payload["reasoning_effort"] = reasoning_budget
+        payload["thinking_budget_tokens"] = _reasoning_budget_map[reasoning_budget]
 
-    combined_mask = Image.new("L", image.size, 0)
-    for layer in (editor_value.get("layers") or []):
-        if layer is None:
-            continue
-        if not isinstance(layer, Image.Image):
-            layer = Image.fromarray(layer)
-        layer_rgba = layer.convert("RGBA").resize(image.size, Image.LANCZOS)
-        combined_mask = Image.fromarray(
-            np.maximum(
-                np.array(combined_mask),
-                np.array(layer_rgba.split()[3])
-            )
-        )
-
-    if not np.any(np.array(combined_mask)):
-        return image  # no strokes drawn, return original
-
-    overlay     = Image.new("RGB", image.size, (220, 50, 50))
-    base        = image.convert("RGB")
-    # Scale mask to 50% opacity for the overlay blend
-    blend_mask  = Image.fromarray((np.array(combined_mask) * 0.55).astype(np.uint8))
-    preview     = base.copy()
-    preview.paste(overlay, mask=blend_mask)
-    return preview
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api_key and api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+        response = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        print(f"[Vision Prompt] Merge call timed out after {timeout_seconds}s")
+        return None
+    except Exception as e:
+        print(f"[Vision Prompt] Merge API error: {e}")
+        return None
 
 class VisionPromptScript(scripts.Script):
 
@@ -189,28 +246,6 @@ class VisionPromptScript(scripts.Script):
                 padding: 4px;
                 margin: 0px;
             }
-            /* Constrain mask editor canvas to viewport so it never overflows */
-            [id^="vp_mask_editor_"] .image-editor-container,
-            [id^="vp_mask_editor_"] canvas {
-                max-height: 50vh !important;
-                object-fit: contain !important;
-            }
-
-            [id^="vp_mask_editor_"] .image-editor {
-                max-height: 50vh !important;
-                overflow: hidden !important;
-            }
-
-            /* Style for checkbox in tab label */
-            .tab-checkbox {
-                display: inline-block;
-                margin-left: 8px;
-                vertical-align: middle;
-            }
-            .tab-checkbox input[type="checkbox"] {
-                margin: 0;
-                vertical-align: middle;
-            }
             .bottom-align {
                 display: flex !important;
                 flex-direction: column !important;
@@ -222,7 +257,7 @@ class VisionPromptScript(scripts.Script):
         with gr.Accordion("Vision Prompt", open=False):
             with gr.Row():
                 enabled = gr.Checkbox(
-                    label="Enable Vision Prompt", 
+                    label="Enable Vision Prompt",
                     value=False)
 
             with gr.Row():
@@ -274,7 +309,7 @@ class VisionPromptScript(scripts.Script):
                     max_tokens = gr.Slider(
                         label="Max Tokens",
                         minimum=16,
-                        maximum=8192,
+                        maximum=16384,
                         value=512,
                         step=16
                     )
@@ -295,7 +330,7 @@ class VisionPromptScript(scripts.Script):
                         value=10,
                         step=1
                     )
-					
+
                 with gr.Row(elem_id="reasoning-row"):
                     always_regenerate = gr.Checkbox(
                         label="Skip Cache",
@@ -304,7 +339,7 @@ class VisionPromptScript(scripts.Script):
                         scale=1,
                         elem_classes=["bottom-align"]
                     )
-                    
+
                     write_png_meta = gr.Checkbox(
                         label="Store Infotext",
                         value=False,
@@ -312,12 +347,12 @@ class VisionPromptScript(scripts.Script):
                         scale=2,
                         elem_classes=["bottom-align"]
                     )
-                    
-                    reasoning_budget = gr.Dropdown(
+
+                    reasoning_budget = gr.Radio(
                         label="Model Reasoning", show_label=False,
                         choices=["none", "low", "medium", "high"],
                         value="none",
-                        info="Reasoning mode for models that support it. Needs Max Tokens >2048",
+                        info=("Reasoning mode for models that support it. Needs Max Tokens >2048"),
                         scale=2,
                         elem_classes=["bottom-align"]
                     )
@@ -325,10 +360,8 @@ class VisionPromptScript(scripts.Script):
             tabs_data = []
 
             with gr.Tabs():
-                for i in range(3):  # Changed from 4 to 3 slots
-                    # Create tab with checkbox in label
+                for i in range(3):
                     with gr.Tab(f"Vision Input #{i+1}") as tab:
-                        # Add a row at the top with the enable checkbox
                         with gr.Row():
                             slot_enabled = gr.Checkbox(
                                 label="Enable slot",
@@ -337,16 +370,23 @@ class VisionPromptScript(scripts.Script):
                                 min_width=120
                             )
 
-                        # ── Multiple image drop zones ──────────────────────
+                        # ── Multi-image mode selector ──────────────────────────
+                        with gr.Row():
+                            multi_image_mode = gr.Radio(
+                                label="Multi-Image Mode", show_label=False,
+                                choices=["Stitch", "Merge Multicall"],
+                                value="Stitch",
+                                info=("Multi-Image Modes: "
+                                    "[Stitch] Fast and cheap. Combine images side-by-side in one call. "
+                                    "[Merge] Better quality, but much slower. One call per image, then a final call merges results."
+                                ),
+                            )
+
                         gr.Markdown(
-                            f"Upload up to **{IMAGES_PER_SLOT} images** (auto-stitched left → right)"
+                            f"Upload up to **{IMAGES_PER_SLOT} images**"
                         )
 
                         image_inputs    = []
-                        mask_states     = []
-                        original_states = []
-                        edit_buttons    = []
-                        mask_modes      = []  # Per-image mask mode states
 
                         with gr.Row(elem_classes="vp-image-box"):
                             for j in range(IMAGES_PER_SLOT):
@@ -358,149 +398,7 @@ class VisionPromptScript(scripts.Script):
                                         elem_classes="vp-image-box",
                                     )
 
-                                    with gr.Row():
-                                        edit_btn = gr.Button("✏️ Mask", size="sm", min_width=40)
-                                        mask_mode_radio = gr.Radio(
-                                            choices=["exclude", "include"],
-                                            value="include",
-                                            visible=False,
-                                            scale=1
-                                        )
-
                                 image_inputs.append(img_input)
-                                mask_states.append(gr.State(None))
-                                original_states.append(gr.State(None))
-                                edit_buttons.append(edit_btn)
-                                mask_modes.append(gr.State("include"))
-
-                        # One shared ImageEditor per slot — hidden until a Mask button is clicked
-                        with gr.Group(visible=False, elem_classes="vp-params-box") as mask_editor_group:
-                            gr.Markdown("**Draw over areas to mask (red brush)**")
-                            mask_editor = gr.ImageEditor(
-                                label="Mask Editor",
-                                brush=gr.Brush(colors=["#ff0000"], default_size=64, color_mode="fixed"),
-                                eraser=gr.Eraser(),
-                                layers=False,
-                                type="pil",
-                                elem_id=f"vp_mask_editor_{i}",
-                            )
-                            with gr.Row():
-                                apply_mask_btn = gr.Button("✅ Apply mask", variant="primary")
-                                clear_mask_btn = gr.Button("🗑️ Clear mask")
-                                close_mask_btn = gr.Button("✖ Close")
-                            active_mask_idx = gr.State(-1)
-
-                            # Shared mask_mode for editor (synced with active image's mode)
-                            mask_mode = gr.Radio(
-                                label="Mask behavior",
-                                choices=["exclude (hide painted)", "include (keep painted)"],
-                                value="include (keep painted)",
-                            )
-
-                        # Open editor: load image into editor and save original + sync mask_mode
-                        for j in range(IMAGES_PER_SLOT):
-                            def open_editor(img, current_mode, _j=j):
-                                if img is None:
-                                    return (
-                                        gr.update(),
-                                        gr.update(visible=False),
-                                        _j,
-                                        None,
-                                        gr.update(),  # mask_mode update
-                                    )
-                                # current_mode is passed in as a proper Gradio state value
-                                if not current_mode:
-                                    current_mode = "include"
-                                return (
-                                    gr.update(value={
-                                        "background": img,
-                                        "layers": [],
-                                        "composite": img,
-                                    }),
-                                    gr.update(visible=True),
-                                    _j,
-                                    img,  # saved into original_states[j]
-                                    gr.update(value=current_mode),  # Sync editor's mask_mode
-                                )
-                            edit_buttons[j].click(
-                                fn=open_editor,
-                                inputs=[image_inputs[j], mask_modes[j]],
-                                outputs=[mask_editor, mask_editor_group, active_mask_idx, original_states[j], mask_mode],
-                            )
-
-                        # Reset mask/original/mode state whenever a new image is dropped in
-                        for j in range(IMAGES_PER_SLOT):
-                            def on_image_change(new_img, _j=j):
-                                # Returns: original_state, mask_state, mask_mode_state, mask_mode_radio update
-                                if new_img is None:
-                                    return None, None, "include", gr.update(value="include", visible=False)
-                                # New image — clear stale mask data so the fresh image is used
-                                return new_img, None, "include", gr.update(value="include", visible=False)
-                            image_inputs[j].change(
-                                fn=on_image_change,
-                                inputs=[image_inputs[j]],
-                                outputs=[original_states[j], mask_states[j], mask_modes[j], mask_mode],
-                            )
-
-                        # Apply: save mask state, mask_mode, and composite preview onto the upload zone in-place
-                        def do_apply_mask(editor_val, idx, current_mask_mode, *states):
-                            # states = [orig0..N, mask0..N, mode0..N]
-                            originals = list(states[:IMAGES_PER_SLOT])
-                            masks     = list(states[IMAGES_PER_SLOT:IMAGES_PER_SLOT*2])
-                            modes     = list(states[IMAGES_PER_SLOT*2:])
-
-                            if 0 <= idx < len(masks):
-                                masks[idx] = editor_val
-                                modes[idx] = current_mask_mode  # Save the mode
-
-                            image_updates = []
-                            mode_updates = []
-                            for k in range(IMAGES_PER_SLOT):
-                                if k == idx and editor_val is not None and originals[k] is not None:
-                                    image_updates.append(gr.update(value=render_mask_preview(originals[k], editor_val)))
-                                    mode_updates.append(gr.update(value=current_mask_mode, visible=True))
-                                else:
-                                    image_updates.append(gr.update())
-                                    mode_updates.append(gr.update())
-
-                            return [gr.update(visible=False)] + masks + modes + image_updates
-
-                        apply_mask_btn.click(
-                            fn=do_apply_mask,
-                            inputs=[mask_editor, active_mask_idx, mask_mode] + original_states + mask_states + mask_modes,
-                            outputs=[mask_editor_group] + mask_states + mask_modes + image_inputs,
-                        )
-
-                        # Clear: wipe mask state, mode, and restore original image to upload zone
-                        def do_clear_mask(idx, *states):
-                            originals = list(states[:IMAGES_PER_SLOT])
-                            masks     = list(states[IMAGES_PER_SLOT:IMAGES_PER_SLOT*2])
-                            modes     = list(states[IMAGES_PER_SLOT*2:])
-
-                            if 0 <= idx < len(masks):
-                                masks[idx] = None
-                                modes[idx] = "include"  # Reset to default
-
-                            image_updates = [
-                                gr.update(value=originals[k]) if k == idx else gr.update()
-                                for k in range(IMAGES_PER_SLOT)
-                            ]
-                            mode_updates = [
-                                gr.update(value="include", visible=False) if k == idx else gr.update()
-                                for k in range(IMAGES_PER_SLOT)
-                            ]
-                            return [gr.update(value=None)] + masks + modes + image_updates + mode_updates
-
-                        clear_mask_btn.click(
-                            fn=do_clear_mask,
-                            inputs=[active_mask_idx] + original_states + mask_states + mask_modes,
-                            outputs=[mask_editor] + mask_states + mask_modes + image_inputs
-                        )
-
-                        close_mask_btn.click(
-                            fn=lambda: gr.update(visible=False),
-                            outputs=[mask_editor_group],
-                        )
 
                         # ── Preset / system prompt ─────────────────────────
                         gr.Markdown("### Prompt Preset")
@@ -553,18 +451,13 @@ class VisionPromptScript(scripts.Script):
                             step=0.05
                         )
 
-                        # Pack: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
+                        # Pack
                         tabs_data.append(slot_enabled)
+                        tabs_data.append(multi_image_mode)
                         tabs_data.extend(image_inputs)
-                        tabs_data.extend(original_states)
-                        tabs_data.extend(mask_states)
-                        tabs_data.extend(mask_modes)
                         tabs_data.extend([system_prompt, weight])
 
         # ── Persistent settings & PNG metadata ────────────────────────────
-        # Stable label strings become keys in PNG infotext.
-        # api_key intentionally excluded — never write secrets to metadata.
-        # write_png_meta controls whether any of these are actually written at generation time.
         self.infotext_fields = [
             (enabled,        "VP Enabled"),
             (api_url,        "VP API URL"),
@@ -575,16 +468,18 @@ class VisionPromptScript(scripts.Script):
             (max_tokens,     "VP Max Tokens"),
         ]
 
-        # Slot layout: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
-        SLOT_STRIDE       = 1 + IMAGES_PER_SLOT * 4 + 2  # 1 for slot_enabled + images + modes + system_prompt + weight
+        # Slot layout: [slot_enabled, multi_image_mode, img0..N, system_prompt, weight]
+        SLOT_STRIDE       = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
         SLOT_ENABLED_OFF  = 0
-        SYSTEM_PROMPT_OFF = 1 + IMAGES_PER_SLOT * 4
-        WEIGHT_OFF        = 1 + IMAGES_PER_SLOT * 4 + 1
+        MULTI_MODE_OFF    = 1
+        SYSTEM_PROMPT_OFF = 2 + IMAGES_PER_SLOT * 1
+        WEIGHT_OFF        = 2 + IMAGES_PER_SLOT * 1 + 1
 
         for i in range(3):
             base = i * SLOT_STRIDE
             self.infotext_fields += [
                 (tabs_data[base + SLOT_ENABLED_OFF],  f"VP Slot {i+1} Enabled"),
+                (tabs_data[base + MULTI_MODE_OFF],    f"VP Slot {i+1} Multi Mode"),
                 (tabs_data[base + SYSTEM_PROMPT_OFF], f"VP Slot {i+1} System Prompt"),
                 (tabs_data[base + WEIGHT_OFF],        f"VP Slot {i+1} Weight"),
             ]
@@ -615,175 +510,74 @@ class VisionPromptScript(scripts.Script):
                 "VP Max Tokens":  max_tokens,
             })
 
-        # Slot layout: [slot_enabled, img0..N, orig0..N, mask0..N, mode0..N, system_prompt, weight]
-        SLOT_STRIDE       = 1 + IMAGES_PER_SLOT * 4 + 2  # 1 for slot_enabled + images + modes + system_prompt + weight
+        # Slot layout: [slot_enabled, multi_image_mode, img0..N, system_prompt, weight]
+        SLOT_STRIDE       = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
         SLOT_ENABLED_OFF  = 0
-        ORIG_OFF          = 1 + IMAGES_PER_SLOT
-        MASK_OFF          = 1 + IMAGES_PER_SLOT * 2
-        MODE_OFF          = 1 + IMAGES_PER_SLOT * 3
-        SYSTEM_PROMPT_OFF = 1 + IMAGES_PER_SLOT * 4
-        WEIGHT_OFF        = 1 + IMAGES_PER_SLOT * 4 + 1
+        MULTI_MODE_OFF    = 1
+        IMG_OFF           = 2
+        SYSTEM_PROMPT_OFF = 2 + IMAGES_PER_SLOT * 1
+        WEIGHT_OFF        = 2 + IMAGES_PER_SLOT * 1 + 1
 
         for i in range(3):
             base = i * SLOT_STRIDE
             if write_png_meta:
-                p.extra_generation_params[f"VP Slot {i+1} Enabled"] = args[base + SLOT_ENABLED_OFF]
+                p.extra_generation_params[f"VP Slot {i+1} Enabled"]    = args[base + SLOT_ENABLED_OFF]
+                p.extra_generation_params[f"VP Slot {i+1} Multi Mode"] = args[base + MULTI_MODE_OFF]
                 p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + SYSTEM_PROMPT_OFF]
-                p.extra_generation_params[f"VP Slot {i+1} Weight"] = args[base + WEIGHT_OFF]
+                p.extra_generation_params[f"VP Slot {i+1} Weight"]     = args[base + WEIGHT_OFF]
 
         combined_prompts = []
+
+        # Shared kwargs for all API helpers
+        api_kwargs = dict(
+            model_name=model_name,
+            api_url=api_url,
+            api_key=api_key,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            reasoning_budget=reasoning_budget,
+            timeout_seconds=timeout_seconds,
+        )
 
         for slot_idx in range(3):
             base = slot_idx * SLOT_STRIDE
 
-            # Check if this slot is enabled
             slot_enabled = args[base + SLOT_ENABLED_OFF]
             if not slot_enabled:
                 continue
 
-            slot_images = [args[base + 1 + j]            for j in range(IMAGES_PER_SLOT)]
-            slot_origs  = [args[base + ORIG_OFF + j]     for j in range(IMAGES_PER_SLOT)]
-            slot_masks  = [args[base + MASK_OFF + j]     for j in range(IMAGES_PER_SLOT)]
-            slot_modes  = [args[base + MODE_OFF + j]     for j in range(IMAGES_PER_SLOT)]
-            system_prompt = args[base + SYSTEM_PROMPT_OFF]
-            weight        = args[base + WEIGHT_OFF]
+            multi_image_mode = args[base + MULTI_MODE_OFF]   # "Stitch" | "Inline Multicall" | "Merge Multicall"
+            slot_images      = [args[base + IMG_OFF  + j]    for j in range(IMAGES_PER_SLOT)]
+            system_prompt    = args[base + SYSTEM_PROMPT_OFF]
+            weight           = args[base + WEIGHT_OFF]
 
-            # Apply masks with per-image modes
             valid_images = []
-            for img, orig, mask_val, mask_mode in zip(slot_images, slot_origs, slot_masks, slot_modes):
-                source = orig if orig is not None else img
-                result = apply_mask(source, mask_val, mask_mode)  # Use per-image mode
-                if result is not None:
-                    valid_images.append(result)
+            for img in slot_images:
+                if img is not None:
+                    valid_images.append(img)
 
             if not valid_images:
                 continue
 
-            # ── Stitch images together ─────────────────────────────────────
-            if len(valid_images) == 1:
-                composed = valid_images[0]
-                stitch_desc = "1 image"
-            else:
-                composed = stitch_images_horizontal(valid_images)
-                stitch_desc = f"{len(valid_images)} images stitched"
-
-            print(f"\n[Vision Prompt][Slot {slot_idx+1}] {stitch_desc}")
-
-            # ── Resize + compress before encoding ─────────────────────────
-            # Most vision APIs cap payloads at a few MB. Downscale to fit,
-            # then encode as JPEG (much smaller than PNG for photos).
-            MAX_LONG_EDGE = 4096  # matches OpenAI's "low detail" threshold
-            MAX_BYTES     = 4 * 1024 * 1024  # 4 MB hard cap
-
-            send_img = composed.copy()
-            if max(send_img.size) > MAX_LONG_EDGE:
-                send_img.thumbnail((MAX_LONG_EDGE, MAX_LONG_EDGE), Image.LANCZOS)
-
-            # Try JPEG at decreasing quality until under the byte cap
-            jpeg_quality = 90
-            while True:
-                buffered = io.BytesIO()
-                send_img.convert("RGB").save(buffered, format="JPEG", quality=jpeg_quality)
-                img_bytes = buffered.getvalue()
-                if len(img_bytes) <= MAX_BYTES or jpeg_quality <= 30:
-                    break
-                jpeg_quality -= 10
-
-            print(
-                f"[Vision Prompt][Slot {slot_idx+1}] "
-                f"Sending {send_img.size[0]}×{send_img.size[1]}px JPEG "
-                f"@ quality={jpeg_quality} ({len(img_bytes)//1024} KB)"
-            )
-
-            # ── Cache key: hash all source images + prompt + model ─────────
-            hash_parts = b"".join(self._pil_to_bytes(img) for img in valid_images)
-            param_str = f"{temperature}|{top_p}|{top_k}|{max_tokens}|{reasoning_budget}"
-
-            # Include all per-image mask modes in cache key
-            mask_modes_str = "|".join(slot_modes)
-            hash_input = (
-                hash_parts
-                + system_prompt.encode("utf-8")
-                + model_name.encode("utf-8")
-                + api_url.encode("utf-8")
-                + param_str.encode("utf-8")
-                + mask_modes_str.encode("utf-8")
-            )
-            cache_key  = hashlib.sha256(hash_input).hexdigest()
-
-            slot_cache = VISION_CACHE[slot_idx]
-
-            if not always_regenerate and cache_key in slot_cache:
-                vision_output = slot_cache[cache_key]
-                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
-            else:
-                if always_regenerate and cache_key in slot_cache:
-                    print(f"[Vision Prompt][Slot {slot_idx+1}] Cache bypassed (Always Re-Generate) — calling API")
-                else:
-                    print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
-
-                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-
-                payload = {
-                    "model": model_name,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": ""},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{img_base64}"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                }
-                if top_k > 0:
-                    payload["top_k"] = top_k
-
-                _reasoning_budget_map = {
-					"none": 0,
-                    "low":    int(max_tokens * 0.2),
-                    "medium": int(max_tokens * 0.5),
-                    "high":  int(max_tokens * 0.8),
-                }
-                if reasoning_budget in _reasoning_budget_map:
-                    payload["reasoning_effort"] = reasoning_budget
-                    payload["thinking_budget_tokens"] = _reasoning_budget_map[reasoning_budget]
-
-                try:
-                    headers = {"Content-Type": "application/json"}
-                    if api_key and api_key.strip():
-                        headers["Authorization"] = f"Bearer {api_key.strip()}"
-                    response = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
-                    response.raise_for_status()
-                    data = response.json()
-                    vision_output = data["choices"][0]["message"]["content"]
-
-                    # Evict oldest entry if at capacity
-                    if len(slot_cache) >= cache_size:
-                        oldest_key = next(iter(slot_cache))
-                        del slot_cache[oldest_key]
-                    slot_cache[cache_key] = vision_output
-                except requests.exceptions.Timeout:
-                    msg = f"[Vision Prompt] Slot {slot_idx+1}: Request timed out after {timeout_seconds}s"
-                    print(msg)
-                    continue
-                except Exception as e:
-                    msg = f"[Vision Prompt]Slot {slot_idx+1}: API error: {e}"
-                    print(msg)
-                    continue
+            # ── Route to the chosen strategy ──────────────────────────────
+            if multi_image_mode == "Stitch" or len(valid_images) == 1:
+                vision_output = self._run_stitch(
+                    valid_images, slot_idx, system_prompt,
+                    always_regenerate, cache_size,
+                    **api_kwargs
+                )
+            else:  # "Merge Multicall"
+                vision_output = self._run_merge_multicall(
+                    valid_images, slot_idx, system_prompt,
+                    always_regenerate, cache_size,
+                    **api_kwargs
+                )
 
             if not vision_output:
                 continue
-            
+
             vision_output   = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
             weighted_prompt = f"({vision_output}:{weight})"
 
@@ -797,14 +591,155 @@ class VisionPromptScript(scripts.Script):
         final_injection = "\n\n".join(combined_prompts)
         print(f"[Vision Prompt] Final Injection:\n{final_injection}")
 
-        p.prompt = f"{final_injection}, {p.prompt}"
+        p.prompt = f"{p.prompt}\n\n{final_injection}"
 
         if hasattr(p, "all_prompts") and p.all_prompts:
             p.all_prompts = [
                 f"{prompt}\n\n{final_injection}" for prompt in p.all_prompts
             ]
 
-    # ── Helpers ────────────────────────────────────────────────────────────
+    # ── Strategy: Stitch ──────────────────────────────────────────────────────
+
+    def _run_stitch(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, **api_kwargs):
+        if len(valid_images) == 1:
+            composed     = valid_images[0]
+            stitch_desc  = "1 image"
+        else:
+            composed     = stitch_images_horizontal(valid_images)
+            stitch_desc  = f"{len(valid_images)} images stitched"
+
+        print(f"\n[Vision Prompt][Slot {slot_idx+1}] Stitch — {stitch_desc}")
+
+        img_b64, w, h, quality, nbytes = _encode_image(composed)
+        print(f"[Vision Prompt][Slot {slot_idx+1}] Sending {w}×{h}px JPEG @ quality={quality} ({nbytes//1024} KB)")
+
+        cache_key = self._cache_key_images(
+            valid_images, system_prompt, api_kwargs, suffix="stitch"
+        )
+        return self._cached_call(
+            cache_key, slot_idx, always_regenerate, cache_size,
+            lambda: _call_vision_api(img_b64, system_prompt, **api_kwargs)
+        )
+
+    # ── Strategy: Merge Multicall ─────────────────────────────────────────────
+
+    def _run_merge_multicall(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, **api_kwargs):
+        """
+        One API call per image (no schema constraints), followed by a second text-only
+        call that merges the individual descriptions into the schema defined by the
+        original system prompt.
+        """
+        print(f"\n[Vision Prompt][Slot {slot_idx+1}] Merge Multicall — {len(valid_images)} image(s)")
+
+        # ── Step 1: describe each image independently ──────────────────────
+        individual_outputs = []
+        individual_cache_keys = []
+
+        for j, img in enumerate(valid_images):
+            img_b64, w, h, quality, nbytes = _encode_image(img)
+            print(f"[Vision Prompt][Slot {slot_idx+1}] Image {j+1}: {w}×{h}px JPEG @ quality={quality} ({nbytes//1024} KB)")
+
+            cache_key = self._cache_key_images(
+                [img], system_prompt, api_kwargs, suffix=f"merge_sub_{j}"
+            )
+            individual_cache_keys.append(cache_key)
+
+            output = self._cached_call(
+                cache_key, slot_idx, always_regenerate, cache_size,
+                lambda b64=img_b64: _call_vision_api(b64, system_prompt, **api_kwargs)
+            )
+
+            if output:
+                individual_outputs.append(output.strip())
+
+        if not individual_outputs:
+            return None
+
+        # If there is only one result there is nothing to merge
+        if len(individual_outputs) == 1:
+            return individual_outputs[0]
+
+        # ── Step 2: merge via a text-only call ────────────────────────────
+        descriptions_block = "\n".join(
+            f"Input #{j+1}: {desc}" for j, desc in enumerate(individual_outputs)
+        )
+
+        merge_system = (
+            "You are a formatting assistant. "
+            "The user will provide inputs, one per line, that have been generated by a previous system prompt. "
+            "Your task is to comine them into a single output that makes sense, "
+            "preserving all descriptive detail and wording as closely as possible. "
+            "Essentially, you pretend to be a vision model. But instead of an image, you get the already processed output.\n\n"
+            f"The following system prompt was used for image analysis:\n{system_prompt}"
+        )
+        merge_user = (
+            f"Process the following {len(individual_outputs)} outputs:\n\n{descriptions_block}"
+        )
+
+        # Cache key for the merge step: hash of all sub-keys + merge prompts
+        merge_hash_input = (
+            "".join(individual_cache_keys)
+            + merge_system
+            + merge_user
+        ).encode("utf-8")
+        merge_cache_key = hashlib.sha256(merge_hash_input).hexdigest()
+
+        text_kwargs = {k: v for k, v in api_kwargs.items()}
+
+        merged = self._cached_call(
+            merge_cache_key, slot_idx, always_regenerate, cache_size,
+            lambda: _call_text_api(merge_system, merge_user, **api_kwargs)
+        )
+
+        return merged
+
+    # ── Cache helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cache_key_images(images, system_prompt, api_kwargs, suffix=""):
+        hash_parts = b"".join(VisionPromptScript._pil_to_bytes(img) for img in images)
+        param_str  = (
+            f"{api_kwargs.get('temperature')}|{api_kwargs.get('top_p')}|"
+            f"{api_kwargs.get('top_k')}|{api_kwargs.get('max_tokens')}|"
+            f"{api_kwargs.get('reasoning_budget', '')}"
+        )
+        raw = (
+            hash_parts
+            + system_prompt.encode("utf-8")
+            + api_kwargs.get("model_name", "").encode("utf-8")
+            + api_kwargs.get("api_url", "").encode("utf-8")
+            + param_str.encode("utf-8")
+            + suffix.encode("utf-8")
+        )
+        return hashlib.sha256(raw).hexdigest()
+
+    def _cached_call(self, cache_key, slot_idx, always_regenerate, cache_size, call_fn):
+        """
+        Look up cache_key in the slot cache. On a miss (or bypass), call call_fn()
+        and store the result. Returns the cached or freshly-fetched string.
+        """
+        slot_cache = VISION_CACHE[slot_idx]
+
+        if not always_regenerate and cache_key in slot_cache:
+            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
+            return slot_cache[cache_key]
+
+        if always_regenerate and cache_key in slot_cache:
+            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache bypassed (Skip Cache) — calling API")
+        else:
+            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
+
+        result = call_fn()
+
+        if result:
+            if len(slot_cache) >= cache_size:
+                oldest_key = next(iter(slot_cache))
+                del slot_cache[oldest_key]
+            slot_cache[cache_key] = result
+
+        return result
+
+    # ── Misc helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _pil_to_bytes(img: Image.Image) -> bytes:
