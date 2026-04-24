@@ -1,21 +1,68 @@
 import base64
-import requests
-from PIL import Image
+import hashlib
 import io
 import json
 import os
+from dataclasses import dataclass
 
 import gradio as gr
+import requests
+from PIL import Image
 
 from modules import scripts
 from modules.processing import StableDiffusionProcessing
 
-import hashlib
-
 VISION_CACHE = [{} for _ in range(3)]  # one dict per slot
-
-# How many image drop zones to show per slot
 IMAGES_PER_SLOT = 3
+
+
+@dataclass
+class APIParams:
+    """Shared API configuration passed through the call stack."""
+    model_name: str
+    api_url: str
+    api_key: str
+    temperature: float
+    top_p: float
+    top_k: int
+    max_tokens: int
+    reasoning_budget: str
+    timeout_seconds: int
+
+    def payload(self, system_prompt: str, user_content) -> dict:
+        """Returns the shared payload attributes for vision and text calls."""
+        p = {
+            "model": self.model_name,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        if self.top_k > 0:
+            p["top_k"] = self.top_k
+
+        _reasoning_budget_map = {
+            "none":   0,
+            "low":    int(self.max_tokens * 0.2),
+            "medium": int(self.max_tokens * 0.5),
+            "high":   int(self.max_tokens * 0.8),
+        }
+        if self.reasoning_budget in _reasoning_budget_map:
+            p["reasoning_effort"] = self.reasoning_budget
+            p["thinking_budget_tokens"] = _reasoning_budget_map[self.reasoning_budget]
+            if self.reasoning_budget != "none":
+                p["reasoning"] = {"effort": self.reasoning_budget}
+
+        return p
+
+    def headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key.strip():
+            h["Authorization"] = f"Bearer {self.api_key.strip()}"
+        return h
 
 def load_presets():
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,120 +146,36 @@ def _encode_image(img: Image.Image, max_long_edge: int = 4096, max_bytes: int = 
 
     return base64.b64encode(img_bytes).decode("utf-8"), send_img.size[0], send_img.size[1], jpeg_quality, len(img_bytes)
 
-def _call_vision_api(
-    img_b64: str,
-    system_prompt: str,
-    model_name: str,
-    api_url: str,
-    api_key: str,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    max_tokens: int,
-    reasoning_budget: str,
-    timeout_seconds: int,
-    user_text: str = "",
-) -> str | None:
-    """
-    Send one image (already base64-encoded) to the vision API.
-    Returns the raw string content or None on failure.
-    """
-    payload = {
-        "model": model_name,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                    }
-                ]
-            }
+def _call_vision_api(img_b64: str, system_prompt: str, params: APIParams, user_text: str = "") -> str | None:
+    """Send one image to the vision API. Returns the content or None on failure."""
+    payload = params.payload(
+        system_prompt,
+        [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
         ],
-    }
-    if top_k > 0:
-        payload["top_k"] = top_k
-
-    _reasoning_budget_map = {
-        "none":   0,
-        "low":    int(max_tokens * 0.2),
-        "medium": int(max_tokens * 0.5),
-        "high":   int(max_tokens * 0.8),
-    }
-    if reasoning_budget in _reasoning_budget_map:
-        payload["reasoning_effort"] = reasoning_budget
-        payload["thinking_budget_tokens"] = _reasoning_budget_map[reasoning_budget]
-
+    )
     try:
-        headers = {"Content-Type": "application/json"}
-        if api_key and api_key.strip():
-            headers["Authorization"] = f"Bearer {api_key.strip()}"
-        response = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response = requests.post(params.api_url, json=payload, headers=params.headers(), timeout=params.timeout_seconds)
         response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        return response.json()["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
-        print(f"[Vision Prompt] Request timed out after {timeout_seconds}s")
+        print(f"[Vision Prompt] Request timed out after {params.timeout_seconds}s")
         return None
     except Exception as e:
         print(f"[Vision Prompt] API error: {e}")
         return None
 
-def _call_text_api(
-    system_prompt: str,
-    user_text: str,
-    model_name: str,
-    api_url: str,
-    api_key: str,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    max_tokens: int,
-    reasoning_budget: str,
-    timeout_seconds: int,
-) -> str | None:
-    """
-    Text-only API call used for the Merge Multicall merge step.
-    """
-    payload = {
-        "model": model_name,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_text},
-        ],
-    }
-    if top_k > 0:
-        payload["top_k"] = top_k
 
-    _reasoning_budget_map = {
-        "none":   0,
-        "low":    int(max_tokens * 0.2),
-        "medium": int(max_tokens * 0.5),
-        "high":   int(max_tokens * 0.8),
-    }
-    if reasoning_budget in _reasoning_budget_map:
-        payload["reasoning_effort"] = reasoning_budget
-        payload["thinking_budget_tokens"] = _reasoning_budget_map[reasoning_budget]
-
+def _call_text_api(system_prompt: str, user_text: str, params: APIParams) -> str | None:
+    """Text-only API call for the Merge Multicall merge step."""
+    payload = params.payload(system_prompt, user_text)
     try:
-        headers = {"Content-Type": "application/json"}
-        if api_key and api_key.strip():
-            headers["Authorization"] = f"Bearer {api_key.strip()}"
-        response = requests.post(api_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response = requests.post(params.api_url, json=payload, headers=params.headers(), timeout=params.timeout_seconds)
         response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        return response.json()["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
-        print(f"[Vision Prompt] Merge call timed out after {timeout_seconds}s")
+        print(f"[Vision Prompt] Merge call timed out after {params.timeout_seconds}s")
         return None
     except Exception as e:
         print(f"[Vision Prompt] Merge API error: {e}")
@@ -527,9 +490,7 @@ class VisionPromptScript(scripts.Script):
                 p.extra_generation_params[f"VP Slot {i+1} Weight"]     = args[base + WEIGHT_OFF]
 
         combined_prompts = []
-
-        # Shared kwargs for all API helpers
-        api_kwargs = dict(
+        params = APIParams(
             model_name=model_name,
             api_url=api_url,
             api_key=api_key,
@@ -568,18 +529,15 @@ class VisionPromptScript(scripts.Script):
             if not valid_images:
                 continue
 
-            # ── Route to the chosen strategy ──────────────────────────────
             if multi_image_mode == "Stitch" or len(valid_images) == 1:
                 vision_output = self._run_stitch(
                     valid_images, slot_idx, system_prompt,
-                    always_regenerate, cache_size,
-                    **api_kwargs
+                    always_regenerate, cache_size, params,
                 )
-            else:  # "Merge Multicall"
+            else:
                 vision_output = self._run_merge_multicall(
                     valid_images, slot_idx, system_prompt,
-                    always_regenerate, cache_size,
-                    **api_kwargs
+                    always_regenerate, cache_size, params,
                 )
 
             if not vision_output:
@@ -607,7 +565,7 @@ class VisionPromptScript(scripts.Script):
 
     # ── Strategy: Stitch ──────────────────────────────────────────────────────
 
-    def _run_stitch(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, **api_kwargs):
+    def _run_stitch(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, params: APIParams):
         if len(valid_images) == 1:
             composed     = valid_images[0]
             stitch_desc  = "1 image"
@@ -621,16 +579,16 @@ class VisionPromptScript(scripts.Script):
         print(f"[Vision Prompt][Slot {slot_idx+1}] Sending {w}×{h}px JPEG @ quality={quality} ({nbytes//1024} KB)")
 
         cache_key = self._cache_key_images(
-            valid_images, system_prompt, api_kwargs, suffix="stitch"
+            valid_images, system_prompt, params, suffix="stitch"
         )
         return self._cached_call(
             cache_key, slot_idx, always_regenerate, cache_size,
-            lambda: _call_vision_api(img_b64, system_prompt, **api_kwargs)
+            lambda: _call_vision_api(img_b64, system_prompt, params)
         )
 
     # ── Strategy: Merge Multicall ─────────────────────────────────────────────
 
-    def _run_merge_multicall(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, **api_kwargs):
+    def _run_merge_multicall(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, params: APIParams):
         """
         One API call per image (no schema constraints), followed by a second text-only
         call that merges the individual descriptions into the schema defined by the
@@ -647,13 +605,13 @@ class VisionPromptScript(scripts.Script):
             print(f"[Vision Prompt][Slot {slot_idx+1}] Image {j+1}: {w}×{h}px JPEG @ quality={quality} ({nbytes//1024} KB)")
 
             cache_key = self._cache_key_images(
-                [img], system_prompt, api_kwargs, suffix=f"merge_sub_{j}"
+                [img], system_prompt, params, suffix=f"merge_sub_{j}"
             )
             individual_cache_keys.append(cache_key)
 
             output = self._cached_call(
                 cache_key, slot_idx, always_regenerate, cache_size,
-                lambda b64=img_b64: _call_vision_api(b64, system_prompt, **api_kwargs)
+                lambda b64=img_b64: _call_vision_api(b64, system_prompt, params)
             )
 
             if output:
@@ -691,11 +649,9 @@ class VisionPromptScript(scripts.Script):
         ).encode("utf-8")
         merge_cache_key = hashlib.sha256(merge_hash_input).hexdigest()
 
-        text_kwargs = {k: v for k, v in api_kwargs.items()}
-
         merged = self._cached_call(
             merge_cache_key, slot_idx, always_regenerate, cache_size,
-            lambda: _call_text_api(merge_system, merge_user, **api_kwargs)
+            lambda: _call_text_api(merge_system, merge_user, params)
         )
 
         return merged
@@ -703,18 +659,18 @@ class VisionPromptScript(scripts.Script):
     # ── Cache helpers ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _cache_key_images(images, system_prompt, api_kwargs, suffix=""):
+    def _cache_key_images(images, system_prompt, params: APIParams, suffix=""):
         hash_parts = b"".join(VisionPromptScript._pil_to_bytes(img) for img in images)
         param_str  = (
-            f"{api_kwargs.get('temperature')}|{api_kwargs.get('top_p')}|"
-            f"{api_kwargs.get('top_k')}|{api_kwargs.get('max_tokens')}|"
-            f"{api_kwargs.get('reasoning_budget', '')}"
+            f"{params.temperature}|{params.top_p}|"
+            f"{params.top_k}|{params.max_tokens}|"
+            f"{params.reasoning_budget}"
         )
         raw = (
             hash_parts
             + system_prompt.encode("utf-8")
-            + api_kwargs.get("model_name", "").encode("utf-8")
-            + api_kwargs.get("api_url", "").encode("utf-8")
+            + params.model_name.encode("utf-8")
+            + params.api_url.encode("utf-8")
             + param_str.encode("utf-8")
             + suffix.encode("utf-8")
         )
