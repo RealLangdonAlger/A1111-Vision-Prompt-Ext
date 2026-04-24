@@ -553,6 +553,13 @@ class VisionPromptScript(scripts.Script):
             system_prompt    = args[base + SYSTEM_PROMPT_OFF]
             weight           = args[base + WEIGHT_OFF]
 
+            # Replace {prompt} and {negative_prompt} placeholders with the main A1111 prompts
+            if "{prompt}" in system_prompt:
+                system_prompt = system_prompt.replace("{prompt}", p.prompt)
+            if "{negative_prompt}" in system_prompt:
+                neg = p.negative_prompt if hasattr(p, "negative_prompt") else ""
+                system_prompt = system_prompt.replace("{negative_prompt}", neg)
+
             valid_images = []
             for img in slot_images:
                 if img is not None:
