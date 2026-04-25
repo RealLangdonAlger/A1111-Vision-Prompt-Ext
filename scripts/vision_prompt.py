@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import gradio as gr
@@ -514,12 +515,34 @@ class VisionPromptScript(scripts.Script):
             system_prompt    = args[base + SYSTEM_PROMPT_OFF]
             weight           = args[base + WEIGHT_OFF]
 
-            # Replace {prompt} and {negative_prompt} placeholders with the main A1111 prompts
-            if "{prompt}" in system_prompt:
-                system_prompt = system_prompt.replace("{prompt}", p.prompt)
-            if "{negative_prompt}" in system_prompt:
-                neg = p.negative_prompt if hasattr(p, "negative_prompt") else ""
-                system_prompt = system_prompt.replace("{negative_prompt}", neg)
+            def _resolve_placeholders(text: str, prompt: str, neg: str) -> str:
+                """Replace {prompt±N} / {negative_prompt±N} placeholders with line-trimmed variants."""
+                lines_pos = prompt.split("\n")
+                lines_neg = neg.split("\n") if neg else []
+
+                def handle(t: str, prefix: str, lines: list) -> str:
+                    # Match {prefix+N} or {prefix-N}
+                    pattern = re.escape(prefix) + r"([+-]\d+)"
+                    for match in re.finditer(pattern, t):
+                        num = int(match.group(1))
+                        if num >= 0:
+                            trimmed = "\n".join(lines[num:]) if num < len(lines) else ""
+                        else:
+                            num = abs(num)
+                            trimmed = "\n".join(lines[:-num]) if num < len(lines) else ""
+                        t = t.replace(match.group(0), trimmed, 1)
+                    return t
+
+                text = handle(text, "{prompt", lines_pos)
+                text = handle(text, "{negative_prompt", lines_neg)
+                # Fallback for plain {prompt} / {negative_prompt} after variants are gone
+                text = text.replace("{prompt}", prompt)
+                text = text.replace("{negative_prompt}", neg)
+                return text
+
+            neg = p.negative_prompt if hasattr(p, "negative_prompt") else ""
+            system_prompt = _resolve_placeholders(system_prompt, p.prompt, neg)
+            if not system_prompt.strip(): continue
 
             valid_images = []
             for img in slot_images:
