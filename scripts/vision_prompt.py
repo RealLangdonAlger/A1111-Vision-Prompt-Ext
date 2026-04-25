@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import gradio as gr
@@ -14,7 +16,15 @@ from modules import scripts
 from modules.processing import StableDiffusionProcessing
 
 VISION_CACHE = [{} for _ in range(3)]  # one dict per slot
+VISION_CACHE_LOCKS = [threading.Lock() for _ in range(3)]
+HTTP_LOCK = threading.Lock()        # serialize actual HTTP requests for endpoints that can't handle parallelism
 IMAGES_PER_SLOT = 3
+SLOT_STRIDE       = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
+SLOT_ENABLED_OFF  = 0
+MULTI_MODE_OFF    = 1
+IMG_OFF           = 2
+SYSTEM_PROMPT_OFF = 2 + IMAGES_PER_SLOT * 1
+WEIGHT_OFF        = 2 + IMAGES_PER_SLOT * 1 + 1
 
 
 @dataclass
@@ -163,6 +173,8 @@ def _call_vision_api(img_b64: str, system_prompt: str, params: APIParams, user_t
     except requests.exceptions.Timeout:
         print(f"[Vision Prompt] Request timed out after {params.timeout_seconds}s")
         return None
+    except (ConnectionError, ConnectionResetError, ConnectionAbortedError) as e:
+        raise  # Let the caller decide whether to retry sequentially
     except Exception as e:
         print(f"[Vision Prompt] API error: {e}")
         return None
@@ -178,6 +190,8 @@ def _call_text_api(system_prompt: str, user_text: str, params: APIParams) -> str
     except requests.exceptions.Timeout:
         print(f"[Vision Prompt] Merge call timed out after {params.timeout_seconds}s")
         return None
+    except (ConnectionError, ConnectionResetError, ConnectionAbortedError) as e:
+        raise
     except Exception as e:
         print(f"[Vision Prompt] Merge API error: {e}")
         return None
@@ -475,13 +489,6 @@ class VisionPromptScript(scripts.Script):
             })
 
         # Slot layout: [slot_enabled, multi_image_mode, img0..N, system_prompt, weight]
-        SLOT_STRIDE       = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
-        SLOT_ENABLED_OFF  = 0
-        MULTI_MODE_OFF    = 1
-        IMG_OFF           = 2
-        SYSTEM_PROMPT_OFF = 2 + IMAGES_PER_SLOT * 1
-        WEIGHT_OFF        = 2 + IMAGES_PER_SLOT * 1 + 1
-
         for i in range(3):
             base = i * SLOT_STRIDE
             if write_png_meta:
@@ -490,7 +497,6 @@ class VisionPromptScript(scripts.Script):
                 p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + SYSTEM_PROMPT_OFF]
                 p.extra_generation_params[f"VP Slot {i+1} Weight"]     = args[base + WEIGHT_OFF]
 
-        combined_prompts = []
         params = APIParams(
             model_name=model_name,
             api_url=api_url,
@@ -503,76 +509,34 @@ class VisionPromptScript(scripts.Script):
             timeout_seconds=timeout_seconds,
         )
 
+        # ── Build slot work items ─────────────────────────────────────────
+        slot_tasks = []
         for slot_idx in range(3):
             base = slot_idx * SLOT_STRIDE
-
-            slot_enabled = args[base + SLOT_ENABLED_OFF]
-            if not slot_enabled:
+            if not args[base + SLOT_ENABLED_OFF]:
                 continue
+            slot_tasks.append({
+                "slot_idx":       slot_idx,
+                "multi_mode":     args[base + MULTI_MODE_OFF],
+                "images":         [args[base + IMG_OFF + j] for j in range(IMAGES_PER_SLOT)],
+                "system_prompt":  args[base + SYSTEM_PROMPT_OFF],
+                "weight":         args[base + WEIGHT_OFF],
+            })
 
-            multi_image_mode = args[base + MULTI_MODE_OFF]   # "Stitch" | "Inline Multicall" | "Merge Multicall"
-            slot_images      = [args[base + IMG_OFF  + j]    for j in range(IMAGES_PER_SLOT)]
-            system_prompt    = args[base + SYSTEM_PROMPT_OFF]
-            weight           = args[base + WEIGHT_OFF]
+        # ── Run all enabled slots in parallel ─────────────────────────────
+        def _run_slot(task):
+            return task["slot_idx"], self._process_slot(
+                p, task["slot_idx"], task["multi_mode"], task["images"],
+                task["system_prompt"], task["weight"],
+                always_regenerate, cache_size, params,
+            )
 
-            def _resolve_placeholders(text: str, prompt: str, neg: str) -> str:
-                """Replace {prompt±N} / {negative_prompt±N} placeholders with line-trimmed variants."""
-                lines_pos = prompt.split("\n")
-                lines_neg = neg.split("\n") if neg else []
+        slot_results = [None] * 3
+        with ThreadPoolExecutor(max_workers=min(len(slot_tasks), 3)) as executor:
+            for slot_idx, result in executor.map(_run_slot, slot_tasks):
+                slot_results[slot_idx] = result
 
-                def handle(t: str, prefix: str, lines: list) -> str:
-                    # Match {prefix+N} or {prefix-N}
-                    pattern = re.escape(prefix) + r"([+-]\d+)"
-                    for match in re.finditer(pattern, t):
-                        num = int(match.group(1))
-                        if num >= 0:
-                            trimmed = "\n".join(lines[num:]) if num < len(lines) else ""
-                        else:
-                            num = abs(num)
-                            trimmed = "\n".join(lines[:-num]) if num < len(lines) else ""
-                        t = t.replace(match.group(0), trimmed, 1)
-                    return t
-
-                text = handle(text, "{prompt", lines_pos)
-                text = handle(text, "{negative_prompt", lines_neg)
-                # Fallback for plain {prompt} / {negative_prompt} after variants are gone
-                text = text.replace("{prompt}", prompt)
-                text = text.replace("{negative_prompt}", neg)
-                return text
-
-            neg = p.negative_prompt if hasattr(p, "negative_prompt") else ""
-            system_prompt = _resolve_placeholders(system_prompt, p.prompt, neg)
-            if not system_prompt.strip(): continue
-
-            valid_images = []
-            for img in slot_images:
-                if img is not None:
-                    valid_images.append(img)
-
-            if not valid_images:
-                continue
-
-            if multi_image_mode == "Stitch" or len(valid_images) == 1:
-                vision_output = self._run_stitch(
-                    valid_images, slot_idx, system_prompt,
-                    always_regenerate, cache_size, params,
-                )
-            else:
-                vision_output = self._run_merge_multicall(
-                    valid_images, slot_idx, system_prompt,
-                    always_regenerate, cache_size, params,
-                )
-
-            if not vision_output:
-                continue
-
-            vision_output   = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
-            weighted_prompt = f"({vision_output}:{weight})"
-
-            print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
-            combined_prompts.append(weighted_prompt)
-
-        # ── Merge all slot outputs into the final prompt ───────────────────
+        combined_prompts = [r for r in slot_results if r]
         if not combined_prompts:
             return
 
@@ -585,6 +549,58 @@ class VisionPromptScript(scripts.Script):
             p.all_prompts = [
                 f"{prompt}\n\n{final_injection}" for prompt in p.all_prompts
             ]
+
+    def _process_slot(self, p, slot_idx, multi_image_mode, slot_images, system_prompt, weight, always_regenerate, cache_size, params: APIParams):
+        def _resolve_placeholders(text: str, prompt: str, neg: str) -> str:
+            lines_pos = prompt.split("\n")
+            lines_neg = neg.split("\n") if neg else []
+
+            def handle(t: str, prefix: str, lines: list) -> str:
+                pattern = re.escape(prefix) + r"([+-]\d+)"
+                for match in re.finditer(pattern, t):
+                    num = int(match.group(1))
+                    if num >= 0:
+                        trimmed = "\n".join(lines[num:]) if num < len(lines) else ""
+                    else:
+                        num = abs(num)
+                        trimmed = "\n".join(lines[:-num]) if num < len(lines) else ""
+                    t = t.replace(match.group(0), trimmed, 1)
+                return t
+
+            text = handle(text, "{prompt", lines_pos)
+            text = handle(text, "{negative_prompt", lines_neg)
+            text = text.replace("{prompt}", prompt)
+            text = text.replace("{negative_prompt}", neg)
+            return text
+
+        neg = p.negative_prompt if hasattr(p, "negative_prompt") else ""
+        system_prompt = _resolve_placeholders(system_prompt, p.prompt, neg)
+        if not system_prompt.strip():
+            return None
+
+        valid_images = [img for img in slot_images if img is not None]
+        if not valid_images:
+            return None
+
+        if multi_image_mode == "Stitch" or len(valid_images) == 1:
+            vision_output = self._run_stitch(
+                valid_images, slot_idx, system_prompt,
+                always_regenerate, cache_size, params,
+            )
+        else:
+            vision_output = self._run_merge_multicall(
+                valid_images, slot_idx, system_prompt,
+                always_regenerate, cache_size, params,
+            )
+
+        if not vision_output:
+            return None
+
+        vision_output = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
+        weighted_prompt = f"({vision_output}:{weight})"
+
+        print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
+        return weighted_prompt
 
     # ── Strategy: Stitch ──────────────────────────────────────────────────────
 
@@ -616,29 +632,33 @@ class VisionPromptScript(scripts.Script):
         One API call per image (no schema constraints), followed by a second text-only
         call that merges the individual descriptions into the schema defined by the
         original system prompt.
+
+        Step 1 is parallelized with ThreadPoolExecutor since each image call is independent.
         """
         print(f"\n[Vision Prompt][Slot {slot_idx+1}] Merge Multicall — {len(valid_images)} image(s)")
 
-        # ── Step 1: describe each image independently ──────────────────────
-        individual_outputs = []
-        individual_cache_keys = []
-
-        for j, img in enumerate(valid_images):
+        # ── Step 1: describe each image independently (parallel) ──────────
+        def _process_one(args_tuple):
+            j, img = args_tuple
             img_b64, w, h, quality, nbytes = _encode_image(img)
             print(f"[Vision Prompt][Slot {slot_idx+1}] Image {j+1}: {w}×{h}px JPEG @ quality={quality} ({nbytes//1024} KB)")
 
             cache_key = self._cache_key_images(
                 [img], system_prompt, params, suffix=f"merge_sub_{j}"
             )
-            individual_cache_keys.append(cache_key)
-
             output = self._cached_call(
                 cache_key, slot_idx, always_regenerate, cache_size,
                 lambda b64=img_b64: _call_vision_api(b64, system_prompt, params)
             )
+            return (j, output.strip() if output else None, cache_key)
 
-            if output:
-                individual_outputs.append(output.strip())
+        with ThreadPoolExecutor(max_workers=min(len(valid_images), 4)) as executor:
+            results = list(executor.map(_process_one, enumerate(valid_images)))
+
+        # Preserve original image order
+        results.sort(key=lambda x: x[0])
+        individual_outputs = [out for _, out, _ in results if out]
+        individual_cache_keys = [ck for _, _, ck in results]
 
         if not individual_outputs:
             return None
@@ -703,25 +723,29 @@ class VisionPromptScript(scripts.Script):
         """
         Look up cache_key in the slot cache. On a miss (or bypass), call call_fn()
         and store the result. Returns the cached or freshly-fetched string.
+        Thread-safe via a per-slot lock.
         """
         slot_cache = VISION_CACHE[slot_idx]
+        lock = VISION_CACHE_LOCKS[slot_idx]
 
-        if not always_regenerate and cache_key in slot_cache:
-            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
-            return slot_cache[cache_key]
+        with lock:
+            if not always_regenerate and cache_key in slot_cache:
+                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
+                return slot_cache[cache_key]
 
-        if always_regenerate and cache_key in slot_cache:
-            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache bypassed (Skip Cache) — calling API")
-        else:
-            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
+            if always_regenerate and cache_key in slot_cache:
+                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache bypassed (Skip Cache) — calling API")
+            else:
+                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
 
         result = call_fn()
 
-        if result:
-            if len(slot_cache) >= cache_size:
-                oldest_key = next(iter(slot_cache))
-                del slot_cache[oldest_key]
-            slot_cache[cache_key] = result
+        with lock:
+            if result:
+                if len(slot_cache) >= cache_size:
+                    oldest_key = next(iter(slot_cache))
+                    del slot_cache[oldest_key]
+                slot_cache[cache_key] = result
 
         return result
 
