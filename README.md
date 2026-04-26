@@ -2,7 +2,7 @@
 
 ## Overview
 
-Vision Prompt Injector is an extension for the AUTOMATIC1111 Stable Diffusion WebUI that allows you to use vision-capable LLMs to automatically generate prompt text from reference images.
+Vision Prompt Injector is an extension for the AUTOMATIC1111 Stable Diffusion WebUI that uses vision-capable LLMs to automatically generate prompt text from reference images.
 
 Instead of manually describing style, composition, or characters, you can feed one or more images into a vision model (OpenAI-compatible API), and inject the generated description directly into your Stable Diffusion prompt.
 
@@ -17,23 +17,28 @@ This is especially useful for:
 
 ## Features
 
-- **3 independent prompt slots** (reduced from 4)
-- Each slot supports **up to 3 images** (auto-stitched horizontally)
+- **3 independent prompt slots** that run in parallel
+- Each slot supports **up to 3 images** with two multi-image modes:
+  - **Stitch**: Combine images side-by-side in one API call (fast, cheap)
+  - **Merge Multicall**: One API call per image, then text-only merge (better quality, slower)
 - **Per-slot enable/disable toggle** in tab header
-- **Image masking system** with three modes: -`none` - No masking -`exclude` - Painted areas are blacked out (LLM ignores them) -`include` - Unpainted areas are blacked out (LLM focuses only on painted areas)
+- **Prompt placeholders** for dynamic system prompts:
+  - `{prompt}` - Full positive prompt text
+  - `{negative_prompt}` - Full negative prompt text
+  - `{prompt+N}` - Prompt starting from line N (0-indexed)
+  - `{prompt-N}` - Prompt excluding last N lines
+  - `{negative_prompt+N}`, `{negative_prompt-N}` - Same for negative prompt
 - **System prompt presets** (loaded from JSON file)
 - Save / delete custom presets from the UI
 - Adjustable **prompt weight (0.0 – 2.0)**
 - **OpenAI-compatible API support** (local or remote)
 - Optional **API key support**
-- **API parameter controls**:
-  - Temperature
-  - Top-p
-  - Top-k
-  - Max tokens
-- **Automatic caching** (avoids repeated API calls)
+- **Response style selector**: strict, balanced, or creative
+- **Reasoning toggle** for thinking models (e.g., o1, Claude 3.7 Sonnet)
+- **Skip cache** option to force fresh API calls
+- **Configurable timeout** (5–600 seconds)
+- **Automatic caching** with LRU eviction (avoids repeated API calls)
 - Image resizing and compression before upload
-- **PNG metadata embedding** - All settings (except API key) are saved to generated images for reproducibility
 
 ---
 
@@ -64,12 +69,12 @@ This is especially useful for:
 ### Per Slot:
 
 - Click the checkbox in the tab header to enable/disable the slot
-- Upload up to 3 images (they will be stitched horizontally)
-- Use the **✏️ Mask** button on any image to draw masks:
-  - Red brush paints areas to mask
-  - Choose mask mode:`none`,`exclude`, or`include`
-  - Click **✅ Apply mask** to save, **🗑️ Clear mask** to reset
+- Select **Multi-Image Mode**:
+  - **Stitch**: Faster, cheaper. Images are combined horizontally and sent in one API call.
+  - **Merge Multicall**: Better quality. Each image gets its own API call, then a final text-only call merges the results.
+- Upload up to 3 images per slot
 - Select a preset or write a custom system prompt
+- Use prompt placeholders to include parts of your main prompt or negative prompt
 - Adjust the weight slider
 
 ### Global Settings:
@@ -77,20 +82,22 @@ This is especially useful for:
 - Set your API endpoint (OpenAI-compatible)
 - Enter API key if required
 - Choose model name
-- Adjust API parameters:
-  - **Temperature** (0.0 – 2.0) - Controls randomness
-  - **Top-p** (0.0 – 1.0) - Nucleus sampling
-  - **Top-k** (0 – 100) - Top-k sampling
-  - **Max Tokens** (16 – 1024) - Response length limit
-- (Optional) Go to WebUI Settings > Defaults > View Changes & Apply
+- Configure response style:
+  - **Strict** (temp=0.2, top_p=0.2) - Consistent, deterministic output
+  - **Balanced** (temp=0.7, top_p=0.9) - Moderate variability
+  - **Creative** (temp=1.2, top_p=1.0) - High variability
+- Enable reasoning for models that support it
+- Set request timeout
+- Toggle skip cache to bypass the cache
 
 ### Generate
 
 - Click **Generate** as usual
 - The extension will:
-  1. Send masked image(s) to the vision model
-  2. Receive a description
-  3. Inject it into your prompt automatically
+  1. Process all enabled slots in parallel
+  2. Send images to the vision model(s)
+  3. Receive descriptions
+  4. Inject them into your prompt automatically
 
 ---
 
@@ -103,6 +110,33 @@ Generated text is wrapped like this:
 ```
 
 All active slots are combined and appended to your prompt in order.
+
+---
+
+## Multi-Image Modes
+
+### Stitch (Default)
+Images are resized to the same height and combined horizontally into a single image. One API call is made. Fast and token-efficient.
+
+### Merge Multicall
+Each image is sent to the API independently (in parallel). The individual descriptions are then merged via a text-only API call that renumbers any labels (e.g., `<Character_1>`, `<Character_2>` become sequential). Better for complex multi-character or multi-scene references, but uses more tokens and time.
+
+---
+
+## Prompt Placeholders
+
+System prompts support placeholders that get replaced at generation time:
+
+| Placeholder | Replaced With |
+|-------------|---------------|
+| `{prompt}` | Full positive prompt text |
+| `{negative_prompt}` | Full negative prompt text |
+| `{prompt+0}` | Entire prompt from line 0 (first line) |
+| `{prompt+2}` | Prompt starting from line 3 |
+| `{prompt-1}` | Prompt excluding the last line |
+| `{negative_prompt+1}` | Negative prompt from line 2 onwards |
+
+This is useful for instructing the vision model to respect existing prompt structure or to focus on specific parts of your prompt.
 
 ---
 
@@ -126,42 +160,24 @@ You can:
 
 The extension caches results based on:
 
-- Image content (including masks)
-- System prompt
-- Model name
-- API parameters
-- Per-image mask modes
+- Image pixel data
+- System prompt (after placeholder resolution)
+- Model name and API URL
+- Response style and reasoning settings
 
-If nothing changes, the API will not be called again.
+If nothing changes, the API will not be called again. Cache is stored in memory (50 entries per slot, LRU eviction) and resets when WebUI restarts.
 
-Cache is stored in memory and resets when WebUI restarts.
-
----
-
-## PNG Metadata
-
-All settings (except API key) are embedded into generated images as infotext. This allows you to:
-
-- Reproduce exact settings by dragging the image back into the WebUI
-- See which vision model and parameters were used
-- Preserve slot configurations for future reference
-
-Embedded information includes:
-
-- Enabled status
-- API URL and model name
-- Temperature, top-p, top-k, max tokens
-- Per-slot: enabled status, system prompt, weight
+Use the **Skip Cache** checkbox to force fresh API calls when needed.
 
 ---
 
 ## Notes
 
 - Large images are automatically resized and compressed before sending
-- Multiple images per slot are stitched side-by-side
-- Special characters in LLM output are escaped for compatibility
-- Masks are visualized with red overlay at 55% opacity in the UI
-- Each image in a slot can have its own independent mask mode
+- Multiple images per slot are processed according to the selected multi-image mode
+- Special characters in LLM output are escaped for Stable Diffusion compatibility
+- All enabled slots run in parallel for faster processing
+- The Merge Multicall mode performs Step 1 (per-image calls) in parallel
 
 ---
 
@@ -170,16 +186,16 @@ Embedded information includes:
 - Use one slot for **style**, another for **composition**, etc.
 - Use lower weights (0.3–0.8) for subtle influence
 - Use higher weights (1.2+) for strong guidance
-- Use **include** mode to focus the LLM on specific areas
-- Use **exclude** mode to hide irrelevant parts of the image
-- Combine multiple images in one slot for complex references
+- Use **Stitch** mode for related images (same character, consistent style)
+- Use **Merge Multicall** for complex multi-character scenes requiring consistent labeling
+- Use prompt placeholders to reference the main prompt in your vision instructions
 
 ---
 
 ## Requirements
 
 - AUTOMATIC1111 WebUI
-- A vision-capable LLM endpoint (OpenAI or compatible)
+- A vision-capable LLM endpoint (OpenAI-compatible API)
 
 ---
 
