@@ -15,9 +15,9 @@ from PIL import Image
 from modules import scripts
 from modules.processing import StableDiffusionProcessing
 
+CACHE_SIZE = 50
 VISION_CACHE = [{} for _ in range(3)]  # one dict per slot
 VISION_CACHE_LOCKS = [threading.Lock() for _ in range(3)]
-HTTP_LOCK = threading.Lock()        # serialize actual HTTP requests for endpoints that can't handle parallelism
 IMAGES_PER_SLOT = 3
 SLOT_STRIDE       = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
 SLOT_ENABLED_OFF  = 0
@@ -33,39 +33,38 @@ class APIParams:
     model_name: str
     api_url: str
     api_key: str
-    temperature: float
-    top_p: float
-    top_k: int
-    max_tokens: int
-    reasoning_budget: str
+    response_style: str  # "strict", "balanced", "creative"
+    enable_reasoning: bool
     timeout_seconds: int
 
     def payload(self, system_prompt: str, user_content) -> dict:
         """Returns the shared payload attributes for vision and text calls."""
+        # Map response style to temperature/top_p
+        style_map = {
+            "strict": (0.2, 0.2),
+            "balanced": (0.7, 0.9),
+            "creative": (1.2, 1.0),
+        }
+        temperature, top_p = style_map.get(self.response_style, (0.5, 1.0))
+
         p = {
             "model": self.model_name,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
+            "temperature": temperature,
+            "top_p": top_p,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
         }
-        if self.top_k > 0:
-            p["top_k"] = self.top_k
 
-        _reasoning_budget_map = {
-            "none":   0,
-            "low":    int(self.max_tokens * 0.2),
-            "medium": int(self.max_tokens * 0.5),
-            "high":   int(self.max_tokens * 0.8),
-        }
-        if self.reasoning_budget in _reasoning_budget_map:
-            p["reasoning_effort"] = self.reasoning_budget
-            p["thinking_budget_tokens"] = _reasoning_budget_map[self.reasoning_budget]
-            if self.reasoning_budget != "none":
-                p["reasoning"] = {"effort": self.reasoning_budget}
+        if self.enable_reasoning:
+            p["reasoning_effort"] = "medium"
+            p["thinking_budget_tokens"] = 4096
+            p["reasoning"] = {"effort": "medium"}
+        else:
+            p["reasoning_effort"] = "none"
+            p["thinking_budget_tokens"] = 0
+            p["reasoning"] = {"effort": "off"}
 
         return p
 
@@ -198,10 +197,6 @@ def _call_text_api(system_prompt: str, user_text: str, params: APIParams) -> str
 
 class VisionPromptScript(scripts.Script):
 
-    def __init__(self):
-        self.infotext_fields = []
-        self.paste_field_names = []
-
     def title(self):
         return "Vision Prompt Injector"
 
@@ -258,81 +253,39 @@ class VisionPromptScript(scripts.Script):
                     scale=2
                 )
 
-            with gr.Accordion("Advanced Settings", open=False, elem_classes="vp-params-box"):
+            with gr.Accordion("Settings", open=False, elem_classes="vp-params-box"):
                 with gr.Row():
-                    temperature = gr.Slider(
-                        label="Temperature",
-                        minimum=0.0,
-                        maximum=2.0,
-                        value=0.7,
-                        step=0.05
+                    response_style = gr.Radio(
+                        label="Response Style", show_label=False,
+                        choices=["strict", "balanced", "creative"],
+                        value="balanced",
+                        info="Sets the variability of the vLLM's output",
+                        scale=4,
+                        elem_classes="bottom-align"
                     )
-
-                    top_p = gr.Slider(
-                        label="Top-p",
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=1.0,
-                        step=0.05
+                    enable_reasoning = gr.Checkbox(
+                        label="Enable Reasoning", 
+                        value=False,
+                        info="For 'thinking' models only",
+                        scale=1,
+                        elem_classes="bottom-align"
                     )
-
-                    top_k = gr.Slider(
-                        label="Top-k",
-                        minimum=0,
-                        maximum=100,
-                        value=0,
-                        step=1
-                    )
-
-                    max_tokens = gr.Slider(
-                        label="Max Tokens",
-                        minimum=16,
-                        maximum=16384,
-                        value=512,
-                        step=16
-                    )
-
-                with gr.Row():
-                    timeout_seconds = gr.Slider(
-                        label="Request Timeout (seconds)",
-                        minimum=5,
-                        maximum=120,
-                        value=30,
-                        step=1
-                    )
-
-                    cache_size = gr.Slider(
-                        label="Cache Size (per slot)",
-                        minimum=1,
-                        maximum=50,
-                        value=10,
-                        step=1
-                    )
-
-                with gr.Row(elem_id="reasoning-row"):
-                    always_regenerate = gr.Checkbox(
+                    skip_cache = gr.Checkbox(
                         label="Skip Cache",
                         value=False,
-                        info="Always do a fresh API call.",
+                        info="Always do a new API call",
                         scale=1,
-                        elem_classes=["bottom-align"]
+                        elem_classes="bottom-align"
                     )
-
-                    write_png_meta = gr.Checkbox(
-                        label="Store Infotext",
-                        value=False,
-                        info="Writes settings and system prompts to the PNG metadata.",
-                        scale=2,
-                        elem_classes=["bottom-align"]
-                    )
-
-                    reasoning_budget = gr.Radio(
-                        label="Model Reasoning", show_label=False,
-                        choices=["none", "low", "medium", "high"],
-                        value="none",
-                        info=("Reasoning mode for models that support it. Needs Max Tokens >2048"),
-                        scale=2,
-                        elem_classes=["bottom-align"]
+                    timeout_seconds = gr.Number(
+                        label="Request Timeout", show_label=False,
+                        value=30,
+                        minimum=5,
+                        maximum=600,
+                        step=1,
+                        info="Response Timeout",
+                        scale=1,
+                        elem_classes="bottom-align"
                     )
 
             tabs_data = []
@@ -435,17 +388,6 @@ class VisionPromptScript(scripts.Script):
                         tabs_data.extend(image_inputs)
                         tabs_data.extend([system_prompt, weight])
 
-        # ── Persistent settings & PNG metadata ────────────────────────────
-        self.infotext_fields = [
-            (enabled,        "VP Enabled"),
-            (api_url,        "VP API URL"),
-            (model_name,     "VP Model"),
-            (temperature,    "VP Temperature"),
-            (top_p,          "VP Top-p"),
-            (top_k,          "VP Top-k"),
-            (max_tokens,     "VP Max Tokens"),
-        ]
-
         # Slot layout: [slot_enabled, multi_image_mode, img0..N, system_prompt, weight]
         SLOT_STRIDE       = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
         SLOT_ENABLED_OFF  = 0
@@ -453,59 +395,22 @@ class VisionPromptScript(scripts.Script):
         SYSTEM_PROMPT_OFF = 2 + IMAGES_PER_SLOT * 1
         WEIGHT_OFF        = 2 + IMAGES_PER_SLOT * 1 + 1
 
-        for i in range(3):
-            base = i * SLOT_STRIDE
-            self.infotext_fields += [
-                (tabs_data[base + SLOT_ENABLED_OFF],  f"VP Slot {i+1} Enabled"),
-                (tabs_data[base + MULTI_MODE_OFF],    f"VP Slot {i+1} Multi Mode"),
-                (tabs_data[base + SYSTEM_PROMPT_OFF], f"VP Slot {i+1} System Prompt"),
-                (tabs_data[base + WEIGHT_OFF],        f"VP Slot {i+1} Weight"),
-            ]
-
-        self.paste_field_names = [label for _, label in self.infotext_fields]
-
         return [
             enabled, api_url, model_name, api_key,
-            temperature, top_p, top_k, max_tokens,
-            timeout_seconds, cache_size,
-            always_regenerate, write_png_meta,
-            reasoning_budget,
+            response_style, enable_reasoning,
+            timeout_seconds, skip_cache,
         ] + tabs_data
 
-    def process(self, p, enabled, api_url, model_name, api_key, temperature, top_p, top_k, max_tokens, timeout_seconds, cache_size, always_regenerate, write_png_meta, reasoning_budget, *args):
+    def process(self, p, enabled, api_url, model_name, api_key, response_style, enable_reasoning, timeout_seconds, skip_cache, *args):
         if not enabled:
             return
-
-        # ── Write settings to PNG metadata ────────────────────────────────
-        if write_png_meta:
-            p.extra_generation_params.update({
-                "VP Enabled":     enabled,
-                "VP API URL":     api_url,
-                "VP Model":       model_name,
-                "VP Temperature": temperature,
-                "VP Top-p":       top_p,
-                "VP Top-k":       top_k,
-                "VP Max Tokens":  max_tokens,
-            })
-
-        # Slot layout: [slot_enabled, multi_image_mode, img0..N, system_prompt, weight]
-        for i in range(3):
-            base = i * SLOT_STRIDE
-            if write_png_meta:
-                p.extra_generation_params[f"VP Slot {i+1} Enabled"]    = args[base + SLOT_ENABLED_OFF]
-                p.extra_generation_params[f"VP Slot {i+1} Multi Mode"] = args[base + MULTI_MODE_OFF]
-                p.extra_generation_params[f"VP Slot {i+1} System Prompt"] = args[base + SYSTEM_PROMPT_OFF]
-                p.extra_generation_params[f"VP Slot {i+1} Weight"]     = args[base + WEIGHT_OFF]
 
         params = APIParams(
             model_name=model_name,
             api_url=api_url,
             api_key=api_key,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_tokens=max_tokens,
-            reasoning_budget=reasoning_budget,
+            response_style=response_style,
+            enable_reasoning=enable_reasoning,
             timeout_seconds=timeout_seconds,
         )
 
@@ -528,7 +433,7 @@ class VisionPromptScript(scripts.Script):
             return task["slot_idx"], self._process_slot(
                 p, task["slot_idx"], task["multi_mode"], task["images"],
                 task["system_prompt"], task["weight"],
-                always_regenerate, cache_size, params,
+                skip_cache, params,
             )
 
         slot_results = [None] * 3
@@ -550,7 +455,7 @@ class VisionPromptScript(scripts.Script):
                 f"{prompt}\n\n{final_injection}" for prompt in p.all_prompts
             ]
 
-    def _process_slot(self, p, slot_idx, multi_image_mode, slot_images, system_prompt, weight, always_regenerate, cache_size, params: APIParams):
+    def _process_slot(self, p, slot_idx, multi_image_mode, slot_images, system_prompt, weight, skip_cache, params: APIParams):
         def _resolve_placeholders(text: str, prompt: str, neg: str) -> str:
             lines_pos = prompt.split("\n")
             lines_neg = neg.split("\n") if neg else []
@@ -585,12 +490,12 @@ class VisionPromptScript(scripts.Script):
         if multi_image_mode == "Stitch" or len(valid_images) == 1:
             vision_output = self._run_stitch(
                 valid_images, slot_idx, system_prompt,
-                always_regenerate, cache_size, params,
+                skip_cache, params,
             )
         else:
             vision_output = self._run_merge_multicall(
                 valid_images, slot_idx, system_prompt,
-                always_regenerate, cache_size, params,
+                skip_cache, params,
             )
 
         if not vision_output:
@@ -604,7 +509,7 @@ class VisionPromptScript(scripts.Script):
 
     # ── Strategy: Stitch ──────────────────────────────────────────────────────
 
-    def _run_stitch(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, params: APIParams):
+    def _run_stitch(self, valid_images, slot_idx, system_prompt, skip_cache, params: APIParams):
         if len(valid_images) == 1:
             composed     = valid_images[0]
             stitch_desc  = "1 image"
@@ -621,13 +526,13 @@ class VisionPromptScript(scripts.Script):
             valid_images, system_prompt, params, suffix="stitch"
         )
         return self._cached_call(
-            cache_key, slot_idx, always_regenerate, cache_size,
+            cache_key, slot_idx, skip_cache,
             lambda: _call_vision_api(img_b64, system_prompt, params)
         )
 
     # ── Strategy: Merge Multicall ─────────────────────────────────────────────
 
-    def _run_merge_multicall(self, valid_images, slot_idx, system_prompt, always_regenerate, cache_size, params: APIParams):
+    def _run_merge_multicall(self, valid_images, slot_idx, system_prompt, skip_cache, params: APIParams):
         """
         One API call per image (no schema constraints), followed by a second text-only
         call that merges the individual descriptions into the schema defined by the
@@ -647,7 +552,7 @@ class VisionPromptScript(scripts.Script):
                 [img], system_prompt, params, suffix=f"merge_sub_{j}"
             )
             output = self._cached_call(
-                cache_key, slot_idx, always_regenerate, cache_size,
+                cache_key, slot_idx, skip_cache,
                 lambda b64=img_b64: _call_vision_api(b64, system_prompt, params)
             )
             return (j, output.strip() if output else None, cache_key)
@@ -674,11 +579,14 @@ class VisionPromptScript(scripts.Script):
 
         merge_system = (
             "You are a formatting assistant. "
-            "The user will provide inputs, one per line, that have been generated by a previous system prompt. "
-            "Your task is to comine them into a single output that makes sense, "
-            "preserving all descriptive detail and wording as closely as possible. "
-            "Essentially, you pretend to be a vision model. But instead of an image, you get the already processed output.\n\n"
-            f"The following system prompt was used for image analysis:\n{system_prompt}"
+            "The user will provide descriptions of multiple images (Input 1, Input 2, etc.), each generated by the same system prompt. "
+            "Unless otherwise specified, your task is to combine them into a single cohesive output. "
+            "Prioritize the instructions in the original system prompt below.\n\n"
+            "CRITICAL: If the original system prompt uses numbered labels (e.g., <Character_1>, <Character_2>, [Subject 1], [Subject 2], Figure 1/2/3, etc.), "
+            "you MUST renumber them so that Input 1 becomes the first label (1), Input 2 becomes the second label (2), and so on. "
+            "Do NOT keep every input labeled as 1.\n\n"
+            "Preserve all descriptive detail and wording as closely as possible.\n\n"
+            f"The system prompt used for the individual image descriptions was:\n{system_prompt}"
         )
         merge_user = (
             f"Process the following {len(individual_outputs)} outputs:\n\n{descriptions_block}"
@@ -693,7 +601,7 @@ class VisionPromptScript(scripts.Script):
         merge_cache_key = hashlib.sha256(merge_hash_input).hexdigest()
 
         merged = self._cached_call(
-            merge_cache_key, slot_idx, always_regenerate, cache_size,
+            merge_cache_key, slot_idx, skip_cache,
             lambda: _call_text_api(merge_system, merge_user, params)
         )
 
@@ -704,11 +612,7 @@ class VisionPromptScript(scripts.Script):
     @staticmethod
     def _cache_key_images(images, system_prompt, params: APIParams, suffix=""):
         hash_parts = b"".join(VisionPromptScript._pil_to_bytes(img) for img in images)
-        param_str  = (
-            f"{params.temperature}|{params.top_p}|"
-            f"{params.top_k}|{params.max_tokens}|"
-            f"{params.reasoning_budget}"
-        )
+        param_str = f"{params.response_style}|{params.enable_reasoning}"
         raw = (
             hash_parts
             + system_prompt.encode("utf-8")
@@ -719,9 +623,9 @@ class VisionPromptScript(scripts.Script):
         )
         return hashlib.sha256(raw).hexdigest()
 
-    def _cached_call(self, cache_key, slot_idx, always_regenerate, cache_size, call_fn):
+    def _cached_call(self, cache_key, slot_idx, skip_cache, call_fn):
         """
-        Look up cache_key in the slot cache. On a miss (or bypass), call call_fn()
+        Look up cache_key in the slot cache. On a miss, call call_fn()
         and store the result. Returns the cached or freshly-fetched string.
         Thread-safe via a per-slot lock.
         """
@@ -729,20 +633,16 @@ class VisionPromptScript(scripts.Script):
         lock = VISION_CACHE_LOCKS[slot_idx]
 
         with lock:
-            if not always_regenerate and cache_key in slot_cache:
+            if not skip_cache and cache_key in slot_cache:
                 print(f"[Vision Prompt][Slot {slot_idx+1}] Cache HIT")
                 return slot_cache[cache_key]
-
-            if always_regenerate and cache_key in slot_cache:
-                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache bypassed (Skip Cache) — calling API")
-            else:
-                print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
+            print(f"[Vision Prompt][Slot {slot_idx+1}] Cache MISS — calling API")
 
         result = call_fn()
 
         with lock:
-            if result:
-                if len(slot_cache) >= cache_size:
+            if result and not skip_cache:
+                if len(slot_cache) >= CACHE_SIZE:
                     oldest_key = next(iter(slot_cache))
                     del slot_cache[oldest_key]
                 slot_cache[cache_key] = result
