@@ -23,12 +23,14 @@ VISION_CACHE_LOCKS = [threading.Lock() for _ in range(3)]
 IMAGES_PER_SLOT = 3
 
 # Slot layout offsets for parsing args tuple
-SLOT_STRIDE = 1 + 1 + IMAGES_PER_SLOT * 1 + 2
+# Per slot: [enabled, multi_mode, text_only_mode, img0..imgN, system_prompt, weight]
+SLOT_STRIDE = 1 + 1 + 1 + IMAGES_PER_SLOT * 1 + 2
 SLOT_ENABLED_OFF = 0
 MULTI_MODE_OFF = 1
-IMG_OFF = 2
-SYSTEM_PROMPT_OFF = 2 + IMAGES_PER_SLOT * 1
-WEIGHT_OFF = 2 + IMAGES_PER_SLOT * 1 + 1
+TEXT_ONLY_OFF = 2
+IMG_OFF = 3
+SYSTEM_PROMPT_OFF = 3 + IMAGES_PER_SLOT * 1
+WEIGHT_OFF = 3 + IMAGES_PER_SLOT * 1 + 1
 
 # Response style mapping (temperature, top_p)
 STYLE_MAP = {
@@ -328,6 +330,10 @@ class VisionPromptScript(scripts.Script):
                                 scale=0,
                                 min_width=120
                             )
+                            text_only_mode = gr.Checkbox(
+                                label="Text-Only Mode",
+                                value=False,
+                            )
 
                         # ── Multi-image mode selector ──────────────────────────
                         with gr.Row():
@@ -412,6 +418,7 @@ class VisionPromptScript(scripts.Script):
                         # Pack
                         tabs_data.append(slot_enabled)
                         tabs_data.append(multi_image_mode)
+                        tabs_data.append(text_only_mode)
                         tabs_data.extend(image_inputs)
                         tabs_data.extend([system_prompt, weight])
 
@@ -443,6 +450,7 @@ class VisionPromptScript(scripts.Script):
             slot_tasks.append({
                 "slot_idx":       slot_idx,
                 "multi_mode":     args[base + MULTI_MODE_OFF],
+                "text_only":      args[base + TEXT_ONLY_OFF],
                 "images":         [args[base + IMG_OFF + j] for j in range(IMAGES_PER_SLOT)],
                 "system_prompt":  args[base + SYSTEM_PROMPT_OFF],
                 "weight":         args[base + WEIGHT_OFF],
@@ -453,7 +461,7 @@ class VisionPromptScript(scripts.Script):
             slot_idx = task["slot_idx"]
             try:
                 result = self._process_slot(
-                    p, slot_idx, task["multi_mode"], task["images"],
+                    p, slot_idx, task["multi_mode"], task["text_only"], task["images"],
                     task["system_prompt"], task["weight"],
                     skip_cache, params,
                 )
@@ -482,7 +490,7 @@ class VisionPromptScript(scripts.Script):
                 f"{prompt}\n\n{final_injection}" for prompt in p.all_prompts
             ]
 
-    def _process_slot(self, p, slot_idx, multi_image_mode, slot_images, system_prompt, weight, skip_cache, params: APIParams):
+    def _process_slot(self, p, slot_idx, multi_image_mode, text_only_mode, slot_images, system_prompt, weight, skip_cache, params: APIParams):
         def _handle_line_refs(text: str, prefix: str, lines: list) -> str:
             """Replace {prefix+N} and {prompt-N} with line slices from lines."""
             pattern = re.escape(prefix) + r"([+-]\d+)"
@@ -517,6 +525,10 @@ class VisionPromptScript(scripts.Script):
         if not system_prompt.strip():
             return None
 
+        # Text-Only Mode: Skip all image processing, just inject the system prompt
+        if text_only_mode:
+            return self._run_text_only(slot_idx, system_prompt, skip_cache, params, weight)
+
         valid_images = [img for img in slot_images if img is not None]
         if not valid_images:
             return None
@@ -540,6 +552,57 @@ class VisionPromptScript(scripts.Script):
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
         return weighted_prompt
+
+    # ── Strategy: Text-Only Mode ───────────────────────────────────────────────
+
+    def _run_text_only(self, slot_idx, system_prompt, skip_cache, params: APIParams, weight: float):
+        """
+        Text-only mode: No images processed. System prompt is still cached.
+        Uses a null placeholder for the image data in the cache key.
+        """
+        print(f"\n[Vision Prompt][Slot {slot_idx+1}] Text-Only Mode")
+
+        cache_key = self._cache_key_text_only(system_prompt, params)
+
+        def call_fn():
+            """Call the API with no image - pure text prompt injection."""
+            payload = params.payload(
+                system_prompt,
+                [{"type": "text", "text": "Respond to the system instructions above."}],
+            )
+            try:
+                response = requests.post(params.api_url, json=payload, headers=params.headers(), timeout=params.timeout_seconds)
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"]
+            except requests.exceptions.Timeout:
+                print(f"[Vision Prompt][Slot {slot_idx+1}] Request timed out after {params.timeout_seconds}s")
+                return None
+            except Exception as e:
+                print(f"[Vision Prompt][Slot {slot_idx+1}] API error: {e}")
+                return None
+
+        result = self._cached_call(cache_key, slot_idx, skip_cache, call_fn)
+        if not result:
+            return None
+
+        result = result.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
+        weighted_prompt = f"({result}:{weight})"
+
+        print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
+        return weighted_prompt
+
+    @staticmethod
+    def _cache_key_text_only(system_prompt: str, params: APIParams) -> str:
+        """Generate cache key for text-only mode (no image data)."""
+        param_str = f"{params.response_style}|{params.enable_reasoning}"
+        raw = (
+            b"TEXT_ONLY_NULL"  # Null placeholder for image data
+            + system_prompt.encode("utf-8")
+            + params.model_name.encode("utf-8")
+            + params.api_url.encode("utf-8")
+            + param_str.encode("utf-8")
+        )
+        return hashlib.sha256(raw).hexdigest()
 
     # ── Strategy: Stitch ──────────────────────────────────────────────────────
 
