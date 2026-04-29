@@ -95,48 +95,90 @@ class APIParams:
             h["Authorization"] = f"Bearer {self.api_key.strip()}"
         return h
 
-def _get_preset_path() -> str:
-    """Returns the path to the presets.json file."""
+def _get_base_preset_path() -> str:
+    """Returns the path to the base presets.json file."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, "..", "presets.json")
 
 
-def load_presets() -> dict:
-    """Load presets from the presets.json file."""
+def _get_user_preset_path() -> str:
+    """Returns the path to the user presets file in the WebUI's tmp directory."""
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    webui_base = os.path.dirname(os.path.dirname(os.path.dirname(scripts_dir)))
+    return os.path.join(webui_base, "tmp", "vision-prompt-presets_user.json")
+
+
+def _load_json_file(path: str) -> dict:
+    """Load a JSON file, returning empty dict on any error."""
     try:
-        with open(_get_preset_path(), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+    except FileNotFoundError:
+        return {}
     except Exception as e:
-        print(f"[Vision Prompt] Failed to load presets: {e}")
-        return {"Custom": ""}
+        print(f"[Vision Prompt] Failed to load {path}: {e}")
+        return {}
+
+
+def _save_json_file(path: str, data: dict) -> None:
+    """Save a dict to a JSON file, creating parent dirs if needed."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def load_presets() -> dict:
+    """Load base presets, then overlay user presets (user overrides base)."""
+    base = _load_json_file(_get_base_preset_path())
+    if not base:
+        base = {"Custom": ""}
+    user = _load_json_file(_get_user_preset_path())
+    base.update(user)
+    return base
 
 
 SYSTEM_PROMPT_PRESETS = load_presets()
 
 
-def _write_presets() -> None:
-    """Write current presets to the presets.json file."""
-    with open(_get_preset_path(), "w", encoding="utf-8") as f:
-        json.dump(SYSTEM_PROMPT_PRESETS, f, indent=2, ensure_ascii=False)
-
 def save_preset(name: str, prompt: str) -> tuple[gr.Dropdown, str]:
-    """Save a new preset with the given name and prompt."""
-    if not name.strip():
-        raise Exception("[Vision Prompt] Preset name cannot be empty.")
-    SYSTEM_PROMPT_PRESETS[name.strip()] = prompt
-    _write_presets()
+    """Save a preset to the user presets file."""
+    name = name.strip()
+    if not name:
+        return gr.update(), ""
+
+    user_path = _get_user_preset_path()
+    user_presets = _load_json_file(user_path)
+    user_presets[name] = prompt
+    _save_json_file(user_path, user_presets)
+
+    SYSTEM_PROMPT_PRESETS[name] = prompt
     choices = list(SYSTEM_PROMPT_PRESETS.keys())
-    return gr.update(choices=choices, value=name.strip()), name.strip()
+    return gr.update(choices=choices, value=name), name
 
 
 def delete_preset(name: str) -> tuple[gr.Dropdown, str]:
-    """Delete a preset by name. Cannot delete the 'Custom' preset."""
+    """Delete a preset. Cannot delete the 'Custom' preset."""
     if name == "Custom":
-        raise Exception("[Vision Prompt] Cannot delete the Custom preset.")
+        return gr.update(), "Custom"
+
+    user_path = _get_user_preset_path()
+    user_presets = _load_json_file(user_path)
+
+    if name in user_presets:
+        del user_presets[name]
+        _save_json_file(user_path, user_presets)
+    else:
+        base_path = _get_base_preset_path()
+        base_presets = _load_json_file(base_path)
+        if name in base_presets:
+            del base_presets[name]
+            _save_json_file(base_path, base_presets)
+
     SYSTEM_PROMPT_PRESETS.pop(name, None)
-    _write_presets()
     choices = list(SYSTEM_PROMPT_PRESETS.keys())
-    return gr.update(choices=choices, value="Custom"), "Custom"
+    fallback = choices[0] if choices else "Custom"
+    return gr.update(choices=choices, value=fallback), fallback
+
 
 def stitch_images_horizontal(images: list[Image.Image], gap: int = 0) -> Image.Image:
     """
