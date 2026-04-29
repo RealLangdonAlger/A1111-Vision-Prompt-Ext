@@ -470,6 +470,7 @@ class VisionPromptScript(scripts.Script):
         ] + tabs_data
 
     def process(self, p, enabled, api_url, model_name, api_key, response_style, enable_reasoning, timeout_seconds, skip_cache, *args):
+        self._vision_injection = None
         if not enabled:
             return
 
