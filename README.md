@@ -22,6 +22,7 @@ This is especially useful for:
   - **Stitch**: Combine images side-by-side in one API call (fast, cheap)
   - **Merge Multicall**: One API call per image, then text-only merge (better quality, slower)
 - **Per-slot enable/disable toggle** in tab header
+- **Text-Only Mode** per slot — skip image processing entirely, use the LLM to generate prompt content from the system prompt alone
 - **Prompt placeholders** for dynamic system prompts:
   - `{prompt}` - Full positive prompt text
   - `{negative_prompt}` - Full negative prompt text
@@ -29,7 +30,7 @@ This is especially useful for:
   - `{prompt-N}` - Prompt excluding last N lines
   - `{negative_prompt+N}`, `{negative_prompt-N}` - Same for negative prompt
 - **System prompt presets** (loaded from JSON file)
-- Save / delete custom presets from the UI
+- Save / delete custom presets from the UI (saved to a separate user file, survives extension updates)
 - Adjustable **prompt weight (0.0 – 2.0)**
 - **OpenAI-compatible API support** (local or remote)
 - Optional **API key support**
@@ -72,7 +73,8 @@ This is especially useful for:
 - Select **Multi-Image Mode**:
   - **Stitch**: Faster, cheaper. Images are combined horizontally and sent in one API call.
   - **Merge Multicall**: Better quality. Each image gets its own API call, then a final text-only call merges the results.
-- Upload up to 3 images per slot
+- Toggle **Text-Only Mode** to generate prompt content from the system prompt alone (no images needed)
+- Upload up to 3 images per slot (ignored in Text-Only Mode)
 - Select a preset or write a custom system prompt
 - Use prompt placeholders to include parts of your main prompt or negative prompt
 - Adjust the weight slider
@@ -142,16 +144,17 @@ This is useful for instructing the vision model to respect existing prompt struc
 
 ## Presets
 
-Presets are stored in:
+Presets come from two sources:
 
-```
-extensions/vision_prompt_ext/presets.json
-```
+1. **Base presets** (`extensions/vision_prompt_ext/presets.json`) — shipped with the extension
+2. **User presets** (`tmp/vision-prompt-presets_user.json`) — your custom additions, saved separately so they survive extension updates
+
+When a user preset has the same name as a base preset, the user version takes precedence.
 
 You can:
 
 - Select from existing presets
-- Save new ones
+- Save new ones (saved to user presets file)
 - Delete unwanted presets (except "Custom")
 
 ---
@@ -171,6 +174,12 @@ Use the **Skip Cache** checkbox to force fresh API calls when needed.
 
 ---
 
+## Hires Fix & Batch Support
+
+Vision prompt injection works with Hires Fix and batch/grid generation. The generated content is injected into `hr_prompt`, batch prompts, and grid prompts so the upscaling pass and all batch images include the vision-generated descriptions.
+
+---
+
 ## Notes
 
 - Large images are automatically resized and compressed before sending
@@ -184,6 +193,7 @@ Use the **Skip Cache** checkbox to force fresh API calls when needed.
 ## Recommended Use Cases
 
 - Use one slot for **style**, another for **composition**, etc.
+- Use **Text-Only Mode** to have the LLM generate descriptive content from a system prompt alone (e.g., "Write a detailed description of a cyberpunk cityscape at night")
 - Use lower weights (0.3–0.8) for subtle influence
 - Use higher weights (1.2+) for strong guidance
 - Use **Stitch** mode for related images (same character, consistent style)
