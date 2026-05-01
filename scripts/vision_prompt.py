@@ -545,15 +545,23 @@ class VisionPromptScript(scripts.Script):
         final_injection = "\n\n".join(combined_prompts)
         print(f"[Vision Prompt] Final Injection:\n{final_injection}")
 
+        # Deduplicate: each slot extracts the same LoRAs from p.prompt
+        seen = set()
+        unique_loras = []
+        for lora in all_loras:
+            if lora not in seen:
+                seen.add(lora)
+                unique_loras.append(lora)
+
         self._vision_injection = final_injection
         self._clear_prompt = clear_prompt
-        self._injection_loras = ", ".join(all_loras) if all_loras else ""
+        self._injection_loras = "".join(unique_loras) if unique_loras else ""
 
         if clear_prompt:
             # Clear main prompt but keep injection for diffusion; append LoRAs
             final_prompt = final_injection
-            if all_loras:
-                final_prompt = ", ".join(all_loras) + "\n\n" + final_prompt
+            if unique_loras:
+                final_prompt = "".join(unique_loras) + "\n\n" + final_prompt
             p.prompt = final_prompt
             if hasattr(p, "hr_prompt"):
                 p.hr_prompt = final_prompt
@@ -715,7 +723,7 @@ class VisionPromptScript(scripts.Script):
         weighted_prompt = f"({vision_output}:{weight})"
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
-        return weighted_prompt, ", ".join(loras)
+        return weighted_prompt, "".join(loras)
 
     # ── Strategy: Text-Only Mode ───────────────────────────────────────────────
 
@@ -753,7 +761,7 @@ class VisionPromptScript(scripts.Script):
         weighted_prompt = f"({result}:{weight})"
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
-        return weighted_prompt, ", ".join(loras)
+        return weighted_prompt, "".join(loras)
 
     @staticmethod
     def _cache_key_text_only(system_prompt: str, params: APIParams) -> str:
