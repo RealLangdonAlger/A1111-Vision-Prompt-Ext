@@ -711,7 +711,7 @@ class VisionPromptScript(scripts.Script):
         if not vision_output:
             return None, ""
 
-        vision_output = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
+        #vision_output = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
         weighted_prompt = f"({vision_output}:{weight})"
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
@@ -749,7 +749,7 @@ class VisionPromptScript(scripts.Script):
         if not result:
             return None
 
-        result = result.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
+        #result = result.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
         weighted_prompt = f"({result}:{weight})"
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
