@@ -53,6 +53,8 @@ MERGE_SYSTEM_TEMPLATE = (
 
 MERGE_USER_TEMPLATE = "Process the following {count} outputs:\n\n{descriptions_block}"
 
+LORA_PATTERN = re.compile(r"<lora[^>]+>")
+
 
 @dataclass
 class APIParams:
@@ -296,6 +298,11 @@ class VisionPromptScript(scripts.Script):
                 margin-top: 8px !important;
                 vertical-align: top !important;
             }
+            #timeout-box input {
+                max-width: 96px !important;
+                width: 96px !important;
+                max-height: 34px !important;
+            }
             </style>
             """)
         with gr.Accordion("Vision Prompt", open=False):
@@ -331,11 +338,22 @@ class VisionPromptScript(scripts.Script):
                         choices=["strict", "balanced", "creative"],
                         value="balanced",
                         info="Sets the variability of the vLLM's output",
-                        scale=4,
+                        scale=2,
                         elem_classes="bottom-align"
                     )
+                    timeout_seconds = gr.Number(
+                        label="Request Timeout", show_label=False,
+                        value=30,
+                        minimum=5,
+                        maximum=600,
+                        step=5,
+                        info="Response Timeout",
+                        scale=1,
+                        elem_classes="bottom-align",
+                        elem_id="timeout-box",
+                    )
                     enable_reasoning = gr.Checkbox(
-                        label="Enable Reasoning", 
+                        label="Enable Reasoning",
                         value=False,
                         info="For 'thinking' models only",
                         scale=1,
@@ -348,13 +366,10 @@ class VisionPromptScript(scripts.Script):
                         scale=1,
                         elem_classes="bottom-align"
                     )
-                    timeout_seconds = gr.Number(
-                        label="Request Timeout", show_label=False,
-                        value=30,
-                        minimum=5,
-                        maximum=600,
-                        step=1,
-                        info="Response Timeout",
+                    clear_prompt = gr.Checkbox(
+                        label="Skip Prompt",
+                        value=False,
+                        info="Keeps {prompt} placeholders",
                         scale=1,
                         elem_classes="bottom-align"
                     )
@@ -466,11 +481,12 @@ class VisionPromptScript(scripts.Script):
         return [
             enabled, api_url, model_name, api_key,
             response_style, enable_reasoning,
-            timeout_seconds, skip_cache,
+            timeout_seconds, skip_cache, clear_prompt,
         ] + tabs_data
 
-    def process(self, p, enabled, api_url, model_name, api_key, response_style, enable_reasoning, timeout_seconds, skip_cache, *args):
+    def process(self, p, enabled, api_url, model_name, api_key, response_style, enable_reasoning, timeout_seconds, skip_cache, clear_prompt, *args):
         self._vision_injection = None
+        self._injection_loras = ""
         if not enabled:
             return
 
@@ -503,8 +519,8 @@ class VisionPromptScript(scripts.Script):
             slot_idx = task["slot_idx"]
             try:
                 result = self._process_slot(
-                    p, slot_idx, task["multi_mode"], task["text_only"], task["images"],
-                    task["system_prompt"], task["weight"],
+                    p, slot_idx, task["multi_mode"], task["text_only"],
+                    task["images"], task["system_prompt"], task["weight"],
                     skip_cache, params,
                 )
                 return slot_idx, result, None
@@ -513,10 +529,14 @@ class VisionPromptScript(scripts.Script):
                 return slot_idx, None, e
 
         slot_results = [None] * 3
+        all_loras = []
         with ThreadPoolExecutor(max_workers=min(len(slot_tasks), 3)) as executor:
             for slot_idx, result, error in executor.map(_run_slot, slot_tasks):
-                if error is None:
-                    slot_results[slot_idx] = result
+                if error is None and result:
+                    weighted_prompt, lora_str = result
+                    slot_results[slot_idx] = weighted_prompt
+                    if lora_str:
+                        all_loras.append(lora_str)
 
         combined_prompts = [r for r in slot_results if r]
         if not combined_prompts:
@@ -526,6 +546,20 @@ class VisionPromptScript(scripts.Script):
         print(f"[Vision Prompt] Final Injection:\n{final_injection}")
 
         self._vision_injection = final_injection
+        self._clear_prompt = clear_prompt
+        self._injection_loras = ", ".join(all_loras) if all_loras else ""
+
+        if clear_prompt:
+            # Clear main prompt but keep injection for diffusion; append LoRAs
+            final_prompt = final_injection
+            if all_loras:
+                final_prompt = ", ".join(all_loras) + "\n\n" + final_prompt
+            p.prompt = final_prompt
+            if hasattr(p, "hr_prompt"):
+                p.hr_prompt = final_prompt
+            if hasattr(p, "all_prompts") and p.all_prompts:
+                p.all_prompts = [final_prompt] * len(p.all_prompts)
+            return
 
         p.prompt = f"{p.prompt}\n\n{final_injection}"
 
@@ -549,6 +583,30 @@ class VisionPromptScript(scripts.Script):
         """Re-inject right before each batch — patches the prompts list A1111 uses for conditioning."""
         injection = getattr(self, "_vision_injection", None)
         if not injection:
+            return
+
+        clear_prompt = getattr(self, "_clear_prompt", False)
+        injection_loras = getattr(self, "_injection_loras", "")
+
+        if clear_prompt:
+            # Clear mode: replace prompt with just the injection; append LoRAs
+            final_prompt = injection
+            if injection_loras:
+                final_prompt = injection_loras + "\n\n" + injection
+            p.prompt = final_prompt
+            if hasattr(p, "all_prompts") and p.all_prompts:
+                p.all_prompts = [final_prompt] * len(p.all_prompts)
+
+            batch_prompts = kwargs.get("prompts")
+            if batch_prompts:
+                for i in range(len(batch_prompts)):
+                    batch_prompts[i] = final_prompt
+
+            for attr in ("hr_prompts", "all_hr_prompts"):
+                hr_list = getattr(p, attr, None)
+                if hr_list:
+                    for i in range(len(hr_list)):
+                        hr_list[i] = final_prompt
             return
 
         marker = "\n\n" + injection
@@ -581,7 +639,7 @@ class VisionPromptScript(scripts.Script):
     def _process_slot(self, p, slot_idx, multi_image_mode, text_only_mode, slot_images, system_prompt, weight, skip_cache, params: APIParams):
         def _handle_line_refs(text: str, prefix: str, lines: list) -> str:
             """Replace {prefix+N} and {prompt-N} with line slices from lines."""
-            pattern = re.escape(prefix) + r"([+-]\d+)"
+            pattern = re.escape(prefix) + r"([+-]\d+)\}"
             for match in re.finditer(pattern, text):
                 num = int(match.group(1))
                 if num >= 0:
@@ -590,6 +648,15 @@ class VisionPromptScript(scripts.Script):
                     num = abs(num)
                     trimmed = "\n".join(lines[:-num]) if num < len(lines) else ""
                 text = text.replace(match.group(0), trimmed, 1)
+            return text
+
+        def _handle_single_line(text: str, prefix: str, lines: list) -> str:
+            """Replace {prefix=N} with the Nth line (1-based, =0 gives empty)."""
+            pattern = re.escape(prefix) + r"=(\d+)\}"
+            for match in re.finditer(pattern, text):
+                num = int(match.group(1))
+                line = lines[num - 1] if 0 < num <= len(lines) else ""
+                text = text.replace(match.group(0), line, 1)
             return text
 
         def _resolve_placeholders(text: str, prompt: str, neg: str) -> str:
@@ -602,6 +669,7 @@ class VisionPromptScript(scripts.Script):
                 ("{negative_prompt", lines_neg),
             ]
             for prefix, lines in replacements:
+                text = _handle_single_line(text, prefix, lines)
                 text = _handle_line_refs(text, prefix, lines)
 
             text = text.replace("{prompt}", prompt)
@@ -609,17 +677,25 @@ class VisionPromptScript(scripts.Script):
             return text
 
         neg = p.negative_prompt if hasattr(p, "negative_prompt") else ""
-        system_prompt = _resolve_placeholders(system_prompt, p.prompt, neg)
+
+        # Extract LoRA tokens from prompt so they can be preserved when Skip Prompt is on
+        loras = LORA_PATTERN.findall(p.prompt)
+        clean_prompt = LORA_PATTERN.sub("", p.prompt).strip()
+        # Collapse any double newlines left by LoRA removal
+        while "\n\n\n" in clean_prompt:
+            clean_prompt = clean_prompt.replace("\n\n\n", "\n\n")
+
+        system_prompt = _resolve_placeholders(system_prompt, clean_prompt, neg)
         if not system_prompt.strip():
-            return None
+            return None, ""
 
         # Text-Only Mode: Skip all image processing, just inject the system prompt
         if text_only_mode:
-            return self._run_text_only(slot_idx, system_prompt, skip_cache, params, weight)
+            return self._run_text_only(slot_idx, system_prompt, skip_cache, params, weight, loras)
 
         valid_images = [img for img in slot_images if img is not None]
         if not valid_images:
-            return None
+            return None, ""
 
         if multi_image_mode == "Stitch" or len(valid_images) == 1:
             vision_output = self._run_stitch(
@@ -633,17 +709,17 @@ class VisionPromptScript(scripts.Script):
             )
 
         if not vision_output:
-            return None
+            return None, ""
 
-        vision_output = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
+        vision_output = vision_output.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
         weighted_prompt = f"({vision_output}:{weight})"
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
-        return weighted_prompt
+        return weighted_prompt, ", ".join(loras)
 
     # ── Strategy: Text-Only Mode ───────────────────────────────────────────────
 
-    def _run_text_only(self, slot_idx, system_prompt, skip_cache, params: APIParams, weight: float):
+    def _run_text_only(self, slot_idx, system_prompt, skip_cache, params: APIParams, weight: float, loras: list[str]):
         """
         Text-only mode: No images processed. System prompt is still cached.
         Uses a null placeholder for the image data in the cache key.
@@ -673,11 +749,11 @@ class VisionPromptScript(scripts.Script):
         if not result:
             return None
 
-        result = result.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]")
+        result = result.strip().replace("\n\n", "\n").replace(":", "\\:").replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
         weighted_prompt = f"({result}:{weight})"
 
         print(f"[Vision Prompt][Slot {slot_idx+1}] {weighted_prompt}")
-        return weighted_prompt
+        return weighted_prompt, ", ".join(loras)
 
     @staticmethod
     def _cache_key_text_only(system_prompt: str, params: APIParams) -> str:

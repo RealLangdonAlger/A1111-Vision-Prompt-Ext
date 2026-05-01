@@ -37,6 +37,7 @@ This is especially useful for:
 - **Response style selector**: strict, balanced, or creative
 - **Reasoning toggle** for thinking models (e.g., o1, Claude 3.7 Sonnet)
 - **Skip cache** option to force fresh API calls
+- **Skip Prompt** mode — replace the main prompt with the vision output while preserving LoRA tokens
 - **Configurable timeout** (5–600 seconds)
 - **Automatic caching** with LRU eviction (avoids repeated API calls)
 - Image resizing and compression before upload
@@ -92,6 +93,10 @@ This is especially useful for:
 - Set request timeout
 - Toggle skip cache to bypass the cache
 
+### Skip Prompt Mode
+
+When **Skip Prompt** is enabled, the main prompt is replaced entirely with the vision-generated output. LoRA tokens (`<lora:name:weight>`) are extracted from the original prompt and prepended to the final output so they still get loaded by A1111.
+
 ### Generate
 
 - Click **Generate** as usual
@@ -133,6 +138,9 @@ System prompts support placeholders that get replaced at generation time:
 |-------------|---------------|
 | `{prompt}` | Full positive prompt text |
 | `{negative_prompt}` | Full negative prompt text |
+| `{prompt=1}` | Only the first line of the prompt |
+| `{prompt=3}` | Only the third line of the prompt |
+| `{prompt=0}` | Empty (for consistency) |
 | `{prompt+0}` | Entire prompt from line 0 (first line) |
 | `{prompt+2}` | Prompt starting from line 3 |
 | `{prompt-1}` | Prompt excluding the last line |
@@ -184,7 +192,8 @@ Vision prompt injection works with Hires Fix and batch/grid generation. The gene
 
 - Large images are automatically resized and compressed before sending
 - Multiple images per slot are processed according to the selected multi-image mode
-- Special characters in LLM output are escaped for Stable Diffusion compatibility
+- Special characters in LLM output are escaped for Stable Diffusion compatibility (`:`, `(`, `)`, `[`, `]`, `{`, `}`)
+- LoRA tokens (`<lora:name:weight>`) are preserved when Skip Prompt is enabled
 - All enabled slots run in parallel for faster processing
 - The Merge Multicall mode performs Step 1 (per-image calls) in parallel
 
